@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from fnmatch import fnmatch
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -15,14 +16,27 @@ import click
 
 from .queue import Queue
 from .tpu import TPU, DEFAULT_TPU_VERSION, resolve_tpu_version
-from .utils import get_logger, jobman_dir, jobman_log_dir
+from .utils import (
+    BREVO_DOCS_URL,
+    brevo_config_path,
+    get_logger,
+    jobman_dir,
+    jobman_log_dir,
+    load_brevo_config,
+    save_brevo_config,
+)
 
 logger = get_logger(__name__)
 
 PRICING_CHOICES = click.Choice(["spot", "preemptible", "standard"])
 MODE_CHOICES = click.Choice(["tpu-vm", "queued-resources"])
 OWNER_FILE = ".jobman_owner"
+BREVO_FILE = ".jobman_brevo.json"
 MAX_OWNER_LENGTH = 20
+ACCELERATOR_PATTERN = re.compile(r"^v[a-z0-9]+-\d+$", re.IGNORECASE)
+ZONE_PATTERN = re.compile(r"^[a-z]+(?:-[a-z0-9]+)+\d-[a-z]$")
+MAIL_TYPE_ORDER = ("BEGIN", "END", "FAIL")
+MAIL_TYPE_CHOICES = {"BEGIN", "END", "FAIL", "ALL", "NONE"}
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +133,16 @@ def worker_start(accelerator, zone, tpu_name, pricing, allocation_mode, startup_
 
 
 @worker.command("stop")
-@click.argument("worker_refs", nargs=-1, required=True)
-def worker_stop(worker_refs):
-    """Stop one or more workers (by name or index from 'jobman status')."""
+@click.argument("worker_refs", nargs=-1)
+@click.option("--all", "stop_all", is_flag=True, help="Stop all registered workers")
+@click.option("--accelerator", "-a", default=None, help="Stop workers matching accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Stop workers matching GCP zone, e.g. us-central2-b")
+def worker_stop(worker_refs, stop_all, accelerator, zone):
+    """Stop workers by explicit ref, or by --all / --accelerator / --zone filter."""
     registry = _read_workers()
-    worker_names = _resolve_worker_names(worker_refs, registry)
+    worker_names = _select_workers(worker_refs, registry, stop_all, accelerator, zone)
+    if worker_names is None:
+        return
     failed = False
     for ref, tpu_name in worker_names:
         if tpu_name is None:
@@ -142,65 +161,71 @@ def worker_stop(worker_refs):
         sys.exit(1)
 
 
-@worker.command("stop-all")
-def worker_stop_all():
-    """Stop all registered workers."""
-    registry = _read_workers()
-    if not registry:
-        click.echo("No workers registered.")
-        return
-    stopped, skipped = 0, 0
-    for tpu_name in registry:
-        session = f"jobman_{tpu_name}"
-        result = subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
-        if result.returncode == 0:
-            _update_worker_status(tpu_name, "stopped")
-            click.echo(f"Stopped: {tpu_name}")
-            stopped += 1
-        else:
-            click.echo(f"Skipped (no session): {tpu_name}")
-            skipped += 1
-    click.echo(f"\n{stopped} stopped, {skipped} skipped.")
-
-
 @worker.command("resume")
-@click.argument("worker_ref")
+@click.argument("worker_refs", nargs=-1)
+@click.option("--all", "resume_all", is_flag=True, help="Resume all registered workers")
+@click.option("--accelerator", "-a", default=None, help="Resume workers matching accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Resume workers matching GCP zone, e.g. us-central2-b")
 @click.option("--debug", is_flag=True, default=False,
               help="Run interactively in the foreground with live output and no log files")
-def worker_resume(worker_ref, debug):
-    """Resume a dead worker (by name or index from 'jobman status')."""
+def worker_resume(worker_refs, resume_all, accelerator, zone, debug):
+    """Resume workers by explicit ref, or by --all / --accelerator / --zone filter."""
     registry = _read_workers()
-    tpu_name = _resolve_worker_name(worker_ref, registry)
-    if tpu_name is None:
-        click.echo(f"Worker '{worker_ref}' not found in registry.", err=True)
+    worker_names = _select_workers(worker_refs, registry, resume_all, accelerator, zone)
+    if worker_names is None:
+        return
+
+    failed = False
+    for ref, tpu_name in worker_names:
+        if tpu_name is None or tpu_name not in registry:
+            click.echo(f"Worker '{ref}' not found in registry.", err=True)
+            failed = True
+            continue
+
+        args = _worker_run_args(registry[tpu_name])
+        if debug:
+            args.append("--debug")
+
+        if debug:
+            if len(worker_names) != 1:
+                raise click.UsageError("--debug can only be used when resuming exactly one worker.")
+            click.echo(f"Resuming worker '{tpu_name}' in debug mode (Ctrl-C to stop)...")
+            os.execvp(args[0], args)
+            return  # unreachable
+
+        session = f"jobman_{tpu_name}"
+        result = subprocess.run(["tmux", "has-session", "-t", session], capture_output=True)
+        if result.returncode == 0:
+            click.echo(f"Worker '{tpu_name}' is already running. "
+                       f"Attach with: tmux attach -t {session}")
+            failed = True
+            continue
+
+        try:
+            subprocess.run(["tmux", "new-session", "-d", "-s", session] + args, check=True)
+        except subprocess.CalledProcessError:
+            click.echo(f"Failed to resume worker '{tpu_name}'.", err=True)
+            failed = True
+            continue
+
+        click.echo(f"Resumed worker '{tpu_name}' in tmux session '{session}'.")
+        click.echo(f"Attach with: tmux attach -t {session}")
+
+    if failed:
         sys.exit(1)
-    args = _worker_run_args(registry[tpu_name])
-    if debug:
-        args.append("--debug")
-
-    if debug:
-        click.echo(f"Resuming worker '{tpu_name}' in debug mode (Ctrl-C to stop)...")
-        os.execvp(args[0], args)
-        return  # unreachable
-
-    session = f"jobman_{tpu_name}"
-    result = subprocess.run(["tmux", "has-session", "-t", session], capture_output=True)
-    if result.returncode == 0:
-        click.echo(f"Worker '{tpu_name}' is already running. "
-                   f"Attach with: tmux attach -t {session}")
-        sys.exit(1)
-
-    subprocess.run(["tmux", "new-session", "-d", "-s", session] + args, check=True)
-    click.echo(f"Resumed worker '{tpu_name}' in tmux session '{session}'.")
-    click.echo(f"Attach with: tmux attach -t {session}")
 
 
 @worker.command("reboot")
-@click.argument("worker_refs", nargs=-1, required=True)
-def worker_reboot(worker_refs):
-    """Reboot one or more workers (by name or index from 'jobman status')."""
+@click.argument("worker_refs", nargs=-1)
+@click.option("--all", "reboot_all", is_flag=True, help="Reboot all registered workers")
+@click.option("--accelerator", "-a", default=None, help="Reboot workers matching accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Reboot workers matching GCP zone, e.g. us-central2-b")
+def worker_reboot(worker_refs, reboot_all, accelerator, zone):
+    """Reboot workers by explicit ref, or by --all / --accelerator / --zone filter."""
     registry = _read_workers()
-    worker_names = _resolve_worker_names(worker_refs, registry)
+    worker_names = _select_workers(worker_refs, registry, reboot_all, accelerator, zone)
+    if worker_names is None:
+        return
     failed = False
 
     for ref, tpu_name in worker_names:
@@ -228,13 +253,19 @@ def worker_reboot(worker_refs):
 
 
 @worker.command("delete")
-@click.argument("worker_refs", nargs=-1, required=True)
-def worker_delete(worker_refs):
-    """Delete one or more workers: stop process, release tasks, delete TPU."""
+@click.argument("worker_refs", nargs=-1)
+@click.option("--all", "delete_all", is_flag=True, help="Delete all registered workers")
+@click.option("--accelerator", "-a", default=None, help="Delete workers matching accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Delete workers matching GCP zone, e.g. us-central2-b")
+def worker_delete(worker_refs, delete_all, accelerator, zone):
+    """Delete workers by explicit ref, or by --all / --accelerator / --zone filter."""
     registry = _read_workers()
-    worker_names = _resolve_worker_names(worker_refs, registry)
+    worker_names = _select_workers(worker_refs, registry, delete_all, accelerator, zone)
+    if worker_names is None:
+        return
     queue = Queue()
     failed = False
+    delete_targets: list[tuple[str, dict]] = []
 
     for ref, tpu_name in worker_names:
         if tpu_name is None or tpu_name not in registry:
@@ -255,6 +286,9 @@ def worker_delete(worker_refs):
         if released:
             click.echo(f"Released tasks: {', '.join(released)}")
 
+        delete_targets.append((tpu_name, worker_cfg))
+
+    def delete_one(tpu_name: str, worker_cfg: dict) -> tuple[str, Exception | None]:
         try:
             TPU(
                 name=worker_cfg["worker_id"],
@@ -264,13 +298,26 @@ def worker_delete(worker_refs):
                 pricing=worker_cfg.get("pricing", "spot"),
                 mode=worker_cfg.get("mode", "tpu-vm"),
             ).delete()
+            return tpu_name, None
         except Exception as e:
-            click.echo(f"Failed to delete TPU for worker '{tpu_name}': {e}", err=True)
-            failed = True
-            continue
+            return tpu_name, e
 
-        _remove_worker(tpu_name)
-        click.echo(f"Worker '{tpu_name}' deleted.")
+    if delete_targets:
+        with ThreadPoolExecutor(max_workers=min(len(delete_targets), 8)) as ex:
+            futures = {
+                ex.submit(delete_one, tpu_name, worker_cfg): tpu_name
+                for tpu_name, worker_cfg in delete_targets
+            }
+            with click.progressbar(length=len(futures), label="Deleting TPUs", show_pos=True) as bar:
+                for fut in as_completed(futures):
+                    tpu_name, err = fut.result()
+                    if err is not None:
+                        click.echo(f"Failed to delete TPU for worker '{tpu_name}': {err}", err=True)
+                        failed = True
+                    else:
+                        _remove_worker(tpu_name)
+                        click.echo(f"Worker '{tpu_name}' deleted.")
+                    bar.update(1)
 
     if failed:
         sys.exit(1)
@@ -347,9 +394,10 @@ def worker_show(worker_ref):
         snapshot_path = os.path.join(jobman_log_dir(), "workers", w["worker_id"], os.path.basename(startup_script))
         click.echo(f"Setup             : {snapshot_path}")
     process_status = _process_status(w)
-    tpu_status = _query_tpu_status(w)
+    vm_status, qr_status = _query_tpu_statuses(w)
     click.echo(f"Process status    : {process_status}")
-    click.echo(f"TPU status        : {tpu_status}")
+    click.echo(f"VM status         : {vm_status}")
+    click.echo(f"QR status         : {qr_status}")
     click.echo(f"Attach with       : tmux attach -t jobman_{w['worker_id']}")
     tpu_url = _tpu_console_url(w)
     if tpu_url:
@@ -362,7 +410,7 @@ def worker_show(worker_ref):
 
 @cli.group()
 def task():
-    """Manage tasks (queue entries and task logs)."""
+    """Manage tasks (queue entries)."""
 
 
 @task.command("submit")
@@ -378,6 +426,8 @@ def submit(script, name, accelerator, zone, tpu_version, max_retries, pricing):
     """Submit a script to the task queue."""
     script_abs = str(Path(script).resolve())
     headers = _parse_headers(script_abs)
+    resolved_mail_user = headers.get("mail-user")
+    resolved_mail_types = _normalize_mail_types(headers.get("mail-type"))
 
     task_spec = {
         "script": script_abs,
@@ -388,14 +438,34 @@ def submit(script, name, accelerator, zone, tpu_version, max_retries, pricing):
         "max_retries": max_retries if max_retries is not None
                        else int(headers.get("max-retries", 3)),
         "pricing": pricing or headers.get("pricing", "spot"),
+        "mail_user": None,
+        "mail_types": [],
+        "mail_config_path": None,
     }
 
     if not task_spec["accelerator"]:
         raise click.UsageError("--accelerator required (or set #JOBMAN --accelerator=...)")
+    _validate_accelerator(task_spec["accelerator"])
     if not task_spec["tpu_version"]:
         task_spec["tpu_version"] = resolve_tpu_version(task_spec["accelerator"])
     if not task_spec["zone"]:
         raise click.UsageError("--zone required (or set #JOBMAN --zone=...)")
+    _validate_zone(task_spec["zone"])
+    if resolved_mail_user and not resolved_mail_types:
+        raise click.UsageError("#JOBMAN --mail-type required when #JOBMAN --mail-user is set.")
+    if resolved_mail_types and not resolved_mail_user:
+        raise click.UsageError("#JOBMAN --mail-user required when #JOBMAN --mail-type is set.")
+    if resolved_mail_user:
+        task_spec["mail_user"] = _validate_email(resolved_mail_user, option_name="#JOBMAN --mail-user")
+        task_spec["mail_types"] = resolved_mail_types
+        task_spec["mail_config_path"] = str(_ensure_brevo_config())
+        brevo_cfg = load_brevo_config(task_spec["mail_config_path"])
+        if brevo_cfg.get("disabled"):
+            click.echo(
+                "Warning: task requests email notifications, but local Brevo sending is disabled "
+                f"in {task_spec['mail_config_path']}. No emails will be sent.",
+                err=True,
+            )
 
     q = Queue()
     task_id = q.submit(task_spec)
@@ -403,6 +473,9 @@ def submit(script, name, accelerator, zone, tpu_version, max_retries, pricing):
     click.echo(f"  Accelerator : {task_spec['accelerator']}")
     click.echo(f"  Zone        : {task_spec['zone']}")
     click.echo(f"  Max retries : {task_spec['max_retries']}")
+    if task_spec["mail_user"]:
+        click.echo(f"  Mail user   : {task_spec['mail_user']}")
+        click.echo(f"  Mail type   : {','.join(task_spec['mail_types'])}")
 
 
 # ---------------------------------------------------------------------------
@@ -410,11 +483,17 @@ def submit(script, name, accelerator, zone, tpu_version, max_retries, pricing):
 # ---------------------------------------------------------------------------
 
 @task.command("delete")
-@click.argument("task_refs", nargs=-1, required=True)
-def delete(task_refs):
-    """Delete one or more pending/running/paused tasks from the queue (by ID or index)."""
+@click.argument("task_refs", nargs=-1)
+@click.option("--all", "delete_all", is_flag=True, help="Delete all tasks")
+@click.option("--accelerator", "-a", default=None, help="Delete tasks matching accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Delete tasks matching GCP zone, e.g. us-central2-b")
+@click.option("--pattern", "-p", default=None, help="Delete tasks whose names match a glob pattern")
+def delete(task_refs, delete_all, accelerator, zone, pattern):
+    """Delete tasks by explicit ref, or by --all / --accelerator / --zone / --pattern filter."""
     q = Queue()
-    task_ids = _resolve_task_ids(task_refs, q)
+    task_ids = _select_tasks(task_refs, q, delete_all, accelerator, zone, pattern)
+    if task_ids is None:
+        return
     failed = False
     for ref, task_id in task_ids:
         if task_id is None:
@@ -431,11 +510,17 @@ def delete(task_refs):
 
 
 @task.command("pause")
-@click.argument("task_refs", nargs=-1, required=True)
-def pause(task_refs):
-    """Pause one or more pending/running tasks (by ID or index from 'jobman status')."""
+@click.argument("task_refs", nargs=-1)
+@click.option("--all", "pause_all", is_flag=True, help="Pause all tasks")
+@click.option("--accelerator", "-a", default=None, help="Pause tasks matching accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Pause tasks matching GCP zone, e.g. us-central2-b")
+@click.option("--pattern", "-p", default=None, help="Pause tasks whose names match a glob pattern")
+def pause(task_refs, pause_all, accelerator, zone, pattern):
+    """Pause tasks by explicit ref, or by --all / --accelerator / --zone / --pattern filter."""
     q = Queue()
-    task_ids = _resolve_task_ids(task_refs, q)
+    task_ids = _select_tasks(task_refs, q, pause_all, accelerator, zone, pattern)
+    if task_ids is None:
+        return
     failed = False
     for ref, task_id in task_ids:
         if task_id is None:
@@ -452,11 +537,17 @@ def pause(task_refs):
 
 
 @task.command("requeue")
-@click.argument("task_refs", nargs=-1, required=True)
-def requeue(task_refs):
-    """Reset one or more failed/paused tasks back to pending (by ID or index from 'jobman status')."""
+@click.argument("task_refs", nargs=-1)
+@click.option("--all", "requeue_all", is_flag=True, help="Requeue all tasks")
+@click.option("--accelerator", "-a", default=None, help="Requeue tasks matching accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Requeue tasks matching GCP zone, e.g. us-central2-b")
+@click.option("--pattern", "-p", default=None, help="Requeue tasks whose names match a glob pattern")
+def requeue(task_refs, requeue_all, accelerator, zone, pattern):
+    """Requeue tasks by explicit ref, or by --all / --accelerator / --zone / --pattern filter."""
     q = Queue()
-    task_ids = _resolve_task_ids(task_refs, q)
+    task_ids = _select_tasks(task_refs, q, requeue_all, accelerator, zone, pattern)
+    if task_ids is None:
+        return
     failed = False
     for ref, task_id in task_ids:
         if task_id is None:
@@ -475,9 +566,10 @@ def requeue(task_refs):
 @cli.command("status")
 @click.option("--accelerator", "-a", default=None, help="Filter by accelerator type, e.g. v4-8")
 @click.option("--zone", "-z", default=None, help="Filter by GCP zone, e.g. us-central2-b")
+@click.option("--live-only", "-lo", is_flag=True, help="Show only workers with queued-resource status ACTIVE")
 @click.option("--workers-only", "-wo", is_flag=True, help="Show only the worker table")
 @click.option("--task-only", "-to", is_flag=True, help="Show only the task table")
-def status(accelerator, zone, workers_only, task_only):
+def status(accelerator, zone, live_only, workers_only, task_only):
     """Show workers and task queue summary."""
     if workers_only and task_only:
         raise click.UsageError("--workers-only and --task-only cannot be used together")
@@ -495,11 +587,19 @@ def status(accelerator, zone, workers_only, task_only):
         if filtered_workers:
             click.echo("Fetching TPU status from GCP...", err=True)
             statuses = _fetch_worker_statuses({w["worker_id"]: w for _, w in filtered_workers})
-            click.echo(f"{'#':<4} {'WORKER':<28} {'ACCELERATOR':<12} {'ZONE':<20} {'PROCESS':<10} {'TPU'}")
+            click.echo(f"{'#':<4} {'WORKER':<28} {'ACCELERATOR':<12} {'ZONE':<20} {'PROCESS':<10} {'VM':<10} {'QR'}")
+            rows = []
             for idx, w in filtered_workers:
-                pstatus, tstatus = statuses.get(w["worker_id"], ("?", "?"))
-                click.echo(f"{idx:<4} {w['worker_id']:<28} {w['accelerator']:<12} {w['zone']:<20} "
-                           f"{pstatus:<10} {tstatus}")
+                pstatus, vm_status, qr_status = statuses.get(w["worker_id"], ("?", "?", "?"))
+                if live_only and qr_status.upper() != "ACTIVE":
+                    continue
+                rows.append((idx, w, pstatus, vm_status, qr_status))
+            if rows:
+                for idx, w, pstatus, vm_status, qr_status in rows:
+                    click.echo(f"{idx:<4} {w['worker_id']:<28} {w['accelerator']:<12} {w['zone']:<20} "
+                               f"{pstatus:<10} {vm_status:<10} {qr_status}")
+            else:
+                click.echo("  (none)")
         else:
             click.echo("  (none)")
 
@@ -520,33 +620,49 @@ def status(accelerator, zone, workers_only, task_only):
     if not tasks:
         click.echo("  (empty)")
         return
-    click.echo(f"{'#':<4} {'ID':<18} {'NAME':<20} {'STATUS':<12} {'ACCELERATOR':<12} {'ZONE':<20} {'WORKER'}")
+    click.echo(f"{'#':<4} {'ID':<18} {'NAME':<40} {'STATUS':<12} {'RETRY':<7} {'ACCELERATOR':<12} {'ZONE':<20} {'WORKER'}")
     for idx, t in tasks:
         worker_id = t.get("worker_id") or "-"
-        click.echo(f"{idx:<4} {t['id']:<18} {t['name']:<20} {t['status']:<12} "
+        retry = f"{t.get('fail_count', 0)}/{t.get('max_retries', 3)}"
+        click.echo(f"{idx:<4} {t['id']:<18} {t['name']:<40} {t['status']:<12} {retry:<7} "
                    f"{t['accelerator']:<12} {t.get('zone',''):<20} {worker_id}")
 
 
-@task.command("logs")
+@task.command("show")
 @click.argument("task_ref")
-@click.option("--lines", "-n", default=50, show_default=True, help="Number of tail lines")
-@click.option("--follow", "-f", is_flag=True, help="Follow log output")
-def logs(task_ref, lines, follow):
-    """Tail the log for a task (by ID or index from 'jobman status')."""
+def task_show(task_ref):
+    """Show detailed information for one task (by ID or index from 'jobman status')."""
     q = Queue()
     task_id = _resolve_task_id(task_ref, q)
     if task_id is None:
         click.echo(f"Task '{task_ref}' not found.", err=True)
         sys.exit(1)
-    log_file = _latest_task_log(task_id)
-    if log_file is None:
-        click.echo(f"No log found for task {task_id}", err=True)
+
+    t = q.get(task_id)
+    if t is None:
+        click.echo(f"Task '{task_ref}' not found.", err=True)
         sys.exit(1)
-    cmd = ["tail", f"-n{lines}"]
-    if follow:
-        cmd.append("-f")
-    cmd.append(log_file)
-    subprocess.run(cmd)
+
+    click.echo(f"Task              : {t['id']}")
+    click.echo(f"Name              : {t.get('name', t['id'])}")
+    click.echo(f"Status            : {t.get('status', '')}")
+    click.echo(f"Accelerator       : {t.get('accelerator', '')}")
+    click.echo(f"Zone              : {t.get('zone', '')}")
+    click.echo(f"TPU version       : {t.get('tpu_version', '')}")
+    click.echo(f"Pricing           : {t.get('pricing', 'spot')}")
+    click.echo(f"Worker            : {t.get('worker_id') or '-'}")
+    click.echo(f"Retries           : {t.get('fail_count', 0)}/{t.get('max_retries', 3)}")
+    click.echo(f"Run count         : {t.get('run_count', 0)}")
+    click.echo(f"Mail user         : {t.get('mail_user') or '-'}")
+    click.echo(f"Mail type         : {','.join(t.get('mail_types', [])) or '-'}")
+    click.echo(f"Submitted         : {t.get('submitted') or '-'}")
+    click.echo(f"Started           : {t.get('started') or '-'}")
+    click.echo(f"Ended             : {t.get('ended') or '-'}")
+    click.echo(f"Script            : {t.get('script') or '-'}")
+    click.echo(f"Source script     : {t.get('source_script') or '-'}")
+    log_file = _latest_task_log(task_id)
+    if log_file:
+        click.echo(f"Latest log        : {log_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -564,8 +680,8 @@ def _process_status(w: dict) -> str:
     return stored
 
 
-def _query_tpu_status(w: dict) -> str:
-    """Query live TPU state from GCP. Returns e.g. READY, CREATING, PREEMPTED, NOT_FOUND."""
+def _query_tpu_statuses(w: dict) -> tuple[str, str]:
+    """Query live TPU VM and queued-resource states from GCP."""
     try:
         tpu = TPU(
             name=w["worker_id"],
@@ -573,25 +689,28 @@ def _query_tpu_status(w: dict) -> str:
             accelerator=w["accelerator"],
             mode=w.get("mode", "tpu-vm"),
         )
-        return tpu.status()
+        return tpu.vm_status(), tpu.queued_resource_status()
     except Exception:
-        return "UNKNOWN"
+        return "UNKNOWN", "UNKNOWN"
 
 
 def _fetch_worker_statuses(workers: dict) -> dict:
     """Fetch process + TPU status for all workers in parallel.
-    Returns {worker_id: (process_status, tpu_status)}.
+    Returns {worker_id: (process_status, vm_status, qr_status)}.
     """
     results = {}
 
     def fetch_one(w):
-        return w["worker_id"], _process_status(w), _query_tpu_status(w)
+        vm_status, qr_status = _query_tpu_statuses(w)
+        return w["worker_id"], _process_status(w), vm_status, qr_status
 
     with ThreadPoolExecutor(max_workers=min(len(workers), 8)) as ex:
         futures = {ex.submit(fetch_one, w): w["worker_id"] for w in workers.values()}
-        for fut in as_completed(futures):
-            wid, pstatus, tstatus = fut.result()
-            results[wid] = (pstatus, tstatus)
+        with click.progressbar(length=len(futures), label="Fetching TPU status", show_pos=True) as bar:
+            for fut in as_completed(futures):
+                wid, pstatus, vm_status, qr_status = fut.result()
+                results[wid] = (pstatus, vm_status, qr_status)
+                bar.update(1)
 
     return results
 
@@ -624,7 +743,7 @@ def _tpu_console_url(worker: dict) -> str:
         return ""
 
     if mode == "queued-resources":
-        path = f"/compute/tpus/queuedResources/details/{zone}/qr-{worker_id}"
+        path = f"/compute/tpus/queuedResources/details/{zone}/{worker_id}"
     else:
         path = f"/compute/tpus/details/{zone}/{worker_id}"
 
@@ -680,6 +799,71 @@ def _prompt_owner_name() -> str:
             click.echo(str(exc), err=True)
 
 
+def _validate_email(value: str, option_name: str = "email") -> str:
+    email = value.strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise click.UsageError(f"Invalid email for {option_name}: {value}")
+    return email
+
+
+def _normalize_mail_types(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    raw_items = [item.strip().upper() for item in value.split(",") if item.strip()]
+    if not raw_items:
+        return []
+    invalid = [item for item in raw_items if item not in MAIL_TYPE_CHOICES]
+    if invalid:
+        raise click.UsageError(
+            f"Invalid --mail-type value(s): {', '.join(invalid)}. "
+            "Use BEGIN, END, FAIL, ALL, or NONE."
+        )
+    if "NONE" in raw_items:
+        if len(raw_items) != 1:
+            raise click.UsageError("NONE cannot be combined with other --mail-type values.")
+        return []
+    expanded = []
+    for item in raw_items:
+        if item == "ALL":
+            expanded.extend(MAIL_TYPE_ORDER)
+        else:
+            expanded.append(item)
+    return [item for item in MAIL_TYPE_ORDER if item in expanded]
+
+
+def _ensure_brevo_config() -> Path:
+    cfg_path = brevo_config_path()
+    if cfg_path.name != BREVO_FILE:
+        raise click.ClickException(f"Unexpected Brevo config path: {cfg_path}")
+    try:
+        config = load_brevo_config(str(cfg_path))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(
+            f"Invalid Brevo config at {cfg_path}: {exc}. Fix or remove it and retry."
+        ) from exc
+    if config.get("disabled"):
+        return cfg_path
+    api_key = config.get("api_key", "")
+    sender_email = config.get("sender_email", "")
+    if api_key and sender_email:
+        return cfg_path
+
+    click.echo("Email notifications use Brevo.")
+    click.echo(f"Brevo setup guide: {BREVO_DOCS_URL}")
+    if click.confirm("Skip Brevo setup for now and disable local email sending?", default=False):
+        save_brevo_config("", "", str(cfg_path), disabled=True)
+        click.echo(f"Saved disabled Brevo config to {cfg_path}")
+        return cfg_path
+    api_key = click.prompt("Enter Brevo API key", hide_input=True).strip()
+    sender_email = _validate_email(
+        click.prompt("Enter verified Brevo sender email").strip(),
+        option_name="Brevo sender email",
+    )
+    save_brevo_config(api_key, sender_email, str(cfg_path))
+    click.echo(f"Saved Brevo config to {cfg_path}")
+    return cfg_path
+
+
 def _generate_tpu_name(accelerator: str) -> str:
     owner = _ensure_owner_name()
     counter_path = os.path.join(jobman_dir(), "worker_counter")
@@ -723,6 +907,24 @@ def _parse_headers(script_path: str) -> dict[str, str]:
                 val = match.group(2) or "true"
                 headers[key] = val
     return headers
+
+
+def _validate_accelerator(value: str) -> str:
+    accelerator = value.strip()
+    if not ACCELERATOR_PATTERN.fullmatch(accelerator):
+        raise click.UsageError(
+            f"Invalid accelerator '{value}'. Expected values like v4-8, v5e-16, or v6e-32."
+        )
+    return accelerator
+
+
+def _validate_zone(value: str) -> str:
+    zone = value.strip()
+    if not ZONE_PATTERN.fullmatch(zone):
+        raise click.UsageError(
+            f"Invalid zone '{value}'. Expected a GCP zone like us-central2-b."
+        )
+    return zone
 
 
 def _read_workers() -> dict:
@@ -789,6 +991,45 @@ def _resolve_task_ids(refs: tuple[str, ...], q: Queue) -> list[tuple[str, str | 
     return resolved
 
 
+def _select_tasks(
+    task_refs: tuple[str, ...],
+    q: Queue,
+    select_all: bool,
+    accelerator: str | None,
+    zone: str | None,
+    pattern: str | None,
+) -> list[tuple[str, str | None]] | None:
+    """Select tasks by explicit refs or by --all / --accelerator / --zone / --pattern filters."""
+    tasks = q.list()
+    if not tasks:
+        click.echo("No tasks in queue.")
+        return None
+
+    using_selector = select_all or accelerator is not None or zone is not None or pattern is not None
+    if task_refs and using_selector:
+        raise click.UsageError("Pass task refs, or use --all / --accelerator / --zone / --pattern, not both.")
+    if not task_refs and not using_selector:
+        raise click.UsageError("Pass task refs, or select tasks with --all / --accelerator / --zone / --pattern.")
+
+    if select_all:
+        return [(t["id"], t["id"]) for t in tasks]
+
+    if accelerator is not None or zone is not None or pattern is not None:
+        task_ids = [
+            (t["id"], t["id"])
+            for t in tasks
+            if (accelerator is None or t.get("accelerator") == accelerator)
+            and (zone is None or t.get("zone") == zone)
+            and (pattern is None or fnmatch(t.get("name", ""), pattern))
+        ]
+        if not task_ids:
+            click.echo("No tasks matched the requested filters.")
+            return None
+        return task_ids
+
+    return _resolve_task_ids(task_refs, q)
+
+
 def _resolve_worker_names(refs: tuple[str, ...], registry: dict) -> list[tuple[str, str | None]]:
     """Resolve multiple worker references against a stable snapshot."""
     workers = list(registry.values())
@@ -801,6 +1042,40 @@ def _resolve_worker_names(refs: tuple[str, ...], registry: dict) -> list[tuple[s
             worker_name = ref
         resolved.append((ref, worker_name))
     return resolved
+
+
+def _select_workers(
+    worker_refs: tuple[str, ...],
+    registry: dict,
+    select_all: bool,
+    accelerator: str | None,
+    zone: str | None,
+) -> list[tuple[str, str | None]] | None:
+    """Select workers by explicit refs or by --all / --accelerator / --zone filters."""
+    if not registry:
+        click.echo("No workers registered.")
+        return None
+
+    using_selector = select_all or accelerator is not None or zone is not None
+    if worker_refs and using_selector:
+        raise click.UsageError("Pass worker refs, or use --all / --accelerator / --zone, not both.")
+    if not worker_refs and not using_selector:
+        raise click.UsageError("Pass worker refs, or select workers with --all / --accelerator / --zone.")
+
+    if select_all:
+        return [(w["worker_id"], w["worker_id"]) for w in registry.values()]
+    if accelerator is not None or zone is not None:
+        worker_names = [
+            (w["worker_id"], w["worker_id"])
+            for w in registry.values()
+            if (accelerator is None or w.get("accelerator") == accelerator)
+            and (zone is None or w.get("zone") == zone)
+        ]
+        if not worker_names:
+            click.echo("No workers matched the requested filters.")
+            return None
+        return worker_names
+    return _resolve_worker_names(worker_refs, registry)
 
 
 def _update_worker_status(tpu_name: str, status: str) -> None:

@@ -1,6 +1,7 @@
 """TPU lifecycle management for jobman-lite."""
 
 import json
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ from .utils import get_logger
 logger = get_logger(__name__)
 
 TPUStatus = Literal["READY", "CREATING", "PREEMPTED", "TERMINATED", "SUSPENDED",
-                    "NOT_FOUND", "UNKNOWN"]
+                    "FAILED", "NOT_FOUND", "UNKNOWN"]
 AllocationMode = Literal["tpu-vm", "queued-resources"]
 Pricing = Literal["spot", "preemptible", "standard"]
 
@@ -31,9 +32,33 @@ def resolve_tpu_version(accelerator: str) -> str:
     return _TPU_VERSION_MAP.get(family, DEFAULT_TPU_VERSION)
 
 
-def _run(cmd: list[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    logger.debug("Running: %s", " ".join(cmd))
-    return subprocess.run(cmd, capture_output=capture, text=True, check=check)
+def _format_cmd(cmd: list[str]) -> str:
+    return shlex.join(cmd)
+
+
+def _command_output(result: subprocess.CompletedProcess) -> str:
+    parts = []
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if stderr:
+        parts.append(f"stderr: {stderr}")
+    if stdout:
+        parts.append(f"stdout: {stdout}")
+    return "\n".join(parts)
+
+
+def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    cmd_str = _format_cmd(cmd)
+    logger.debug("Running: %s", cmd_str)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = _command_output(result) or "no stdout/stderr"
+        logger.warning("gcloud command failed (%d): %s\n%s", result.returncode, cmd_str, detail)
+        if check:
+            raise RuntimeError(
+                f"Command failed ({result.returncode}): {cmd_str}\n{detail}"
+            )
+    return result
 
 
 @dataclass
@@ -49,7 +74,7 @@ class TPU:
     _queued_resource_id: str = field(default="", init=False, repr=False)
 
     def __post_init__(self):
-        self._queued_resource_id = f"qr-{self.name}"
+        self._queued_resource_id = f"{self.name}"
 
     # ------------------------------------------------------------------
     # Public API
@@ -68,6 +93,32 @@ class TPU:
             return self._tpu_vm_status()
         else:
             return self._queued_resource_status()
+
+    def vm_status(self) -> TPUStatus:
+        """Return the TPU VM status directly."""
+        return self._tpu_vm_status()
+
+    def queued_resource_status(self) -> str:
+        """Return the queued resource state directly (e.g. ACTIVE, FAILED, NOT_FOUND)."""
+        if self.mode != "queued-resources":
+            return "-"
+        result = _run([
+            "gcloud", "compute", "tpus", "queued-resources", "describe",
+            self._queued_resource_id,
+            f"--zone={self.zone}", "--format=json"
+        ], check=False)
+        if result.returncode != 0:
+            if "NOT_FOUND" in result.stderr or "not found" in result.stderr.lower():
+                return "NOT_FOUND"
+            return "UNKNOWN"
+        try:
+            info = json.loads(result.stdout)
+            state = info.get("state", {})
+            if isinstance(state, dict):
+                state = state.get("state", "UNKNOWN")
+            return str(state).upper()
+        except (json.JSONDecodeError, KeyError):
+            return "UNKNOWN"
 
     def delete(self) -> None:
         """Delete the TPU VM (and queued resource if applicable)."""
@@ -88,7 +139,7 @@ class TPU:
             if st == "READY":
                 logger.info("TPU %s is READY (%.0fs elapsed)", self.name, elapsed)
                 return
-            if st in ("PREEMPTED", "TERMINATED"):
+            if st in ("PREEMPTED", "TERMINATED", "FAILED"):
                 raise RuntimeError(f"TPU {self.name} entered terminal state: {st}")
             logger.info("TPU %s status=%s, waiting %ds...", self.name, st, interval)
             time.sleep(interval)
@@ -115,7 +166,7 @@ class TPU:
             cmd.append("--preemptible")
         logger.info("Creating TPU VM %s (%s) in %s [%s]...", self.name, self.accelerator,
                     self.zone, self.pricing)
-        _run(cmd, check=True, capture=False)
+        _run(cmd, check=True)
 
     def _tpu_vm_status(self) -> TPUStatus:
         result = _run([
@@ -139,8 +190,9 @@ class TPU:
             "gcloud", "compute", "tpus", "tpu-vm", "delete", self.name,
             f"--zone={self.zone}", "--quiet"
         ], check=False)
-        if result.returncode != 0 and "NOT_FOUND" not in result.stderr:
-            logger.warning("Failed to delete TPU VM %s: %s", self.name, result.stderr)
+        stderr = result.stderr or ""
+        if result.returncode != 0 and "NOT_FOUND" not in stderr and "not found" not in stderr.lower():
+            logger.warning("Failed to delete TPU VM %s", self.name)
 
     # ------------------------------------------------------------------
     # Queued-resources mode helpers
@@ -148,7 +200,7 @@ class TPU:
 
     def _create_queued_resource(self) -> None:
         cmd = [
-            "gcloud", "compute", "tpus", "queued-resources", "create",
+            "gcloud", "alpha", "compute", "tpus", "queued-resources", "create",
             self._queued_resource_id,
             f"--node-id={self.name}",
             f"--zone={self.zone}",
@@ -158,7 +210,7 @@ class TPU:
         if self.pricing == "spot":
             cmd.append("--spot")
         logger.info("Creating queued resource %s for TPU %s...", self._queued_resource_id, self.name)
-        _run(cmd, check=True, capture=False)
+        _run(cmd, check=True)
 
     def _queued_resource_status(self) -> TPUStatus:
         result = _run([
@@ -189,13 +241,13 @@ class TPU:
     def _delete_queued_resource(self) -> None:
         logger.info("Deleting queued resource %s...", self._queued_resource_id)
         result = _run([
-            "gcloud", "compute", "tpus", "queued-resources", "delete",
+            "gcloud", "alpha", "compute", "tpus", "queued-resources", "delete",
             self._queued_resource_id,
             f"--zone={self.zone}", "--quiet", "--force"
         ], check=False)
-        if result.returncode != 0 and "NOT_FOUND" not in result.stderr:
-            logger.warning("Failed to delete queued resource %s: %s",
-                           self._queued_resource_id, result.stderr)
+        stderr = result.stderr or ""
+        if result.returncode != 0 and "NOT_FOUND" not in stderr and "not found" not in stderr.lower():
+            logger.warning("Failed to delete queued resource %s", self._queued_resource_id)
 
 
 # ------------------------------------------------------------------
@@ -212,6 +264,7 @@ def _normalize_status(state: str) -> TPUStatus:
         "TERMINATED": "TERMINATED",
         "SUSPENDING": "SUSPENDED",
         "SUSPENDED": "SUSPENDED",
+        "FAILED": "FAILED",
         "NOT_FOUND": "NOT_FOUND",
     }
     return mapping.get(state, "UNKNOWN")  # type: ignore[return-value]

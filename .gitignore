@@ -1,5 +1,5 @@
 **/__pycache__
-**.egg-info
+**.egg-info/
 
 logs/
 queue.json
@@ -7,7 +7,10 @@ queue.json.lock
 worker_counter
 workers.json
 .jobman_owner
+.jobman_brevo.json
 
 plan.md
 CLAUDE.md
 AGENTS.md
+
+maxtext

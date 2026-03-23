@@ -4,11 +4,50 @@ Lightweight TPU job orchestration. Workers hold TPUs persistently and poll a sha
 
 ## Install
 
+System prerequisites:
+- `tmux` installed on the machine where you run `jobman worker start`
+- Google Cloud SDK (`gcloud`) installed and authenticated
+- TPU APIs enabled in your GCP project, with permissions to create/delete TPU VMs or queued resources
+
 ```bash
 conda create -n jobman-lite python=3.12 -y
 conda activate jobman-lite
 pip install -e .
 ```
+
+Basic checks:
+
+```bash
+tmux -V
+gcloud --version
+gcloud auth list
+gcloud config get-value project
+```
+
+## GCP Auth
+
+Authenticate `gcloud` on the machine where you run `jobman`, then select the project that owns your TPU resources:
+
+```bash
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project <your-gcp-project>
+gcloud config set compute/zone <default-zone>
+```
+
+Useful verification commands:
+
+```bash
+gcloud auth list
+gcloud config list
+gcloud services list --enabled | grep tpu
+```
+
+If TPU creation still fails, check:
+- the active account in `gcloud auth list`
+- the selected project in `gcloud config get-value project`
+- TPU quota in the target zone
+- IAM permissions for TPU VM / queued-resource creation and deletion
 
 ## Script Header Format
 
@@ -19,6 +58,8 @@ pip install -e .
 #JOBMAN --name=my-task          # optional
 #JOBMAN --tpu-version=tpu-ubuntu2204-base  # optional
 #JOBMAN --max-retries=3         # optional
+#JOBMAN --mail-user=you@example.com        # optional
+#JOBMAN --mail-type=BEGIN,END,FAIL         # optional
 
 # Injected env vars: JOBMAN_TPU_NAME, JOBMAN_ZONE, JOBMAN_NUM_WORKERS
 
@@ -36,6 +77,13 @@ python train.py
 # Start a worker (holds the TPU, polls for tasks)
 jobman worker start --accelerator=v4-8 --zone=us-central2-b
 jobman worker stop my-tpu
+jobman worker stop --all
+jobman worker stop -a v4-16 -z us-central2-b
+jobman worker resume my-tpu
+jobman worker resume -a v4-16
+jobman worker reboot my-tpu
+jobman worker reboot --all
+jobman worker reboot -a v4-16 -z us-central2-b
 
 # Submit tasks
 jobman task submit train.sh
@@ -43,19 +91,23 @@ jobman task submit train.sh --name=run-1 --accelerator=v4-8 --zone=us-central2-b
 
 # Monitor
 jobman status
-jobman task logs <task-id>
-jobman task logs <task-id> --follow
+jobman task show <task-id>
 jobman worker show my-tpu
 
 # Manage tasks
 jobman task pause <task-id>
+jobman task pause -p 'llama3*s50*3e-4*'
 jobman task requeue <task-id>   # put a failed/paused task back to pending
+jobman task requeue -a v4-128 -z us-central2-b
 jobman task delete <task-id>
+jobman task delete --all
 ```
 
 `jobman worker start --startup-script ...` now runs that script as worker bootstrap on all TPU hosts after the TPU becomes ready and before the worker claims any tasks. If bootstrap fails, no task is claimed; the worker retries bootstrap after the TPU is healthy again.
 
 `jobman task pause` and `jobman task delete` now affect running tasks as well: the worker notices the queue-state change, terminates the in-flight SSH command, and then either leaves the task paused or removes it entirely.
+
+If you use `#JOBMAN --mail-user=...` and `#JOBMAN --mail-type=...`, jobman will prompt once for a local Brevo API key and verified sender email, then store them in `.jobman_brevo.json`. Brevo setup docs: https://developers.brevo.com/docs/getting-started
 
 ## State Directory
 

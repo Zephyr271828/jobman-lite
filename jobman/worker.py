@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,24 +15,28 @@ from datetime import datetime, timezone
 
 from .queue import Queue
 from .tpu import TPU, AllocationMode, Pricing, DEFAULT_TPU_VERSION
-from .utils import get_logger, jobman_dir, jobman_log_dir
+from .utils import get_logger, jobman_dir, jobman_log_dir, send_brevo_email
 
 logger = get_logger(__name__)
+_RETRYABLE_FAILURE_PATTERN = "Main command finished with errors, check the logs located in"
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _tee_to_stdout(proc) -> None:
+def _tee_to_stdout(proc, buffer: list[str] | None = None) -> None:
     """Read proc.stdout lines and write them to sys.stdout."""
     for line in proc.stdout:
+        if buffer is not None:
+            buffer.append(line)
         sys.stdout.write(line)
         sys.stdout.flush()
 
 
 class Worker:
     _TASK_CONTROL_POLL_INTERVAL = 5
+    _LOOP_ERROR_SLEEP_SECS = 10
 
     def __init__(
         self,
@@ -106,6 +111,7 @@ class Worker:
                     self.worker_id, self.accelerator, self.zone)
         try:
             while True:
+                task: dict | None = None
                 try:
                     self._ensure_tpu_ready()
                     bootstrap_success, bootstrap_preempted = self._ensure_bootstrap_ready()
@@ -123,6 +129,7 @@ class Worker:
                         time.sleep(30)
                         continue
 
+                    self._send_task_notification(task, "BEGIN")
                     outcome, preempted = self._run_task(task)
 
                     if outcome == "deleted":
@@ -135,13 +142,18 @@ class Worker:
                         self.queue.release(task["id"], "interrupted")
                         self._handle_preemption()
                     else:
-                        self.queue.release(task["id"], "done" if outcome == "done" else "failed")
+                        final_task = self.queue.release(task["id"], "done" if outcome == "done" else "failed")
+                        if outcome == "done":
+                            self._send_task_notification(final_task or task, "END")
+                        elif final_task is not None and final_task.get("status") == "failed":
+                            self._send_task_notification(final_task, "FAIL")
 
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
                     logger.exception("Unhandled error in worker loop: %s", e)
-                    time.sleep(10)
+                    self._recover_after_loop_exception(task, e)
+                    time.sleep(self._LOOP_ERROR_SLEEP_SECS)
         except KeyboardInterrupt:
             logger.info("Worker %s shutting down", self.worker_id)
         finally:
@@ -151,6 +163,24 @@ class Worker:
     # ------------------------------------------------------------------
     # TPU management
     # ------------------------------------------------------------------
+
+    def _recover_after_loop_exception(self, task: dict | None, exc: Exception) -> None:
+        """Best-effort recovery after an unexpected loop exception."""
+        self._record_timeline("worker_loop_exception", error=str(exc))
+        if task is None:
+            return
+
+        task_id = task["id"]
+        try:
+            if self._is_preempted():
+                self.queue.release(task_id, "interrupted")
+                self._handle_preemption()
+            else:
+                final_task = self.queue.release(task_id, "failed")
+                if final_task is not None and final_task.get("status") == "failed":
+                    self._send_task_notification(final_task, "FAIL")
+        except Exception:
+            logger.exception("Failed to recover task %s after loop exception", task_id)
 
     def _ensure_tpu_ready(self) -> None:
         status = self.tpu.status()
@@ -207,6 +237,105 @@ class Worker:
             "--command", inline,
         ]
 
+    def _format_cmd(self, cmd: list[str]) -> str:
+        return shlex.join(cmd)
+
+    def _extract_process_error(self, result: subprocess.CompletedProcess, fallback: str) -> str:
+        parts = []
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if stderr:
+            parts.append(f"stderr: {stderr}")
+        if stdout:
+            parts.append(f"stdout: {stdout}")
+        return "\n".join(parts) if parts else fallback
+
+    def _log_gcloud_failure(
+        self,
+        *,
+        op: str,
+        cmd: list[str],
+        returncode: int,
+        detail: str,
+        phase: str,
+        worker_index: int,
+        log_handle=None,
+    ) -> None:
+        cmd_str = self._format_cmd(cmd)
+        message = (
+            f"{op} failed on worker {worker_index} with exit code {returncode}\n"
+            f"command: {cmd_str}\n"
+            f"{detail}"
+        )
+        logger.warning("%s", message)
+        self._record_timeline(
+            f"{op.lower()}_failed",
+            phase=phase,
+            worker_index=worker_index,
+            returncode=returncode,
+            error=detail,
+            command=cmd_str,
+        )
+        if log_handle is not None:
+            log_handle.write(f"=== {op} failed on worker {worker_index} ===\n")
+            log_handle.write(f"command: {cmd_str}\n")
+            log_handle.write(detail)
+            if not detail.endswith("\n"):
+                log_handle.write("\n")
+            log_handle.flush()
+
+    def _run_gcloud_scp(
+        self,
+        local_path: str,
+        remote_path: str,
+        worker_index: int,
+        *,
+        phase: str,
+        log_handle=None,
+    ) -> subprocess.CompletedProcess:
+        cmd = self._scp_cmd(local_path, remote_path, worker_index)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            detail = self._extract_process_error(result, "gcloud scp failed")
+            self._log_gcloud_failure(
+                op="SCP",
+                cmd=cmd,
+                returncode=result.returncode,
+                detail=detail,
+                phase=phase,
+                worker_index=worker_index,
+                log_handle=log_handle,
+            )
+        return result
+
+    def _run_gcloud_ssh(
+        self,
+        worker_index: int,
+        inline: str,
+        *,
+        phase: str,
+        log_handle=None,
+    ) -> subprocess.CompletedProcess:
+        cmd = self._ssh_cmd(worker_index, inline)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            detail = self._extract_process_error(result, "gcloud ssh failed")
+            self._log_gcloud_failure(
+                op="SSH",
+                cmd=cmd,
+                returncode=result.returncode,
+                detail=detail,
+                phase=phase,
+                worker_index=worker_index,
+                log_handle=log_handle,
+            )
+        return result
+
+    def _popen_gcloud_ssh(self, worker_index: int, inline: str, **kwargs) -> subprocess.Popen:
+        cmd = self._ssh_cmd(worker_index, inline)
+        logger.info("Running SSH command on worker %d: %s", worker_index, self._format_cmd(cmd))
+        return subprocess.Popen(cmd, **kwargs)
+
     def _ensure_bootstrap_ready(self) -> tuple[bool, bool]:
         if self._bootstrap_complete or not self.startup_script:
             return True, False
@@ -246,30 +375,40 @@ class Worker:
 
         results: list[tuple[int, bool, str | None]] = []
         preempted = False
+
+        def record_bootstrap_result(worker_index: int, ok: bool, error_text: str | None = None) -> None:
+            status = "ok" if ok else "failed"
+            if lf is not None:
+                lf.write(f"worker {worker_index}: {status}\n")
+                if error_text:
+                    lf.write(f"  detail: {error_text}\n")
+                lf.flush()
+            elif self.debug:
+                print(f"worker {worker_index}: {status}")
+                if error_text:
+                    print(f"  detail: {error_text}")
+
         try:
             for worker_index in range(num_workers):
-                scp_result = subprocess.run(
-                    self._scp_cmd(self.startup_script, remote_setup, worker_index),
-                    capture_output=True,
-                    text=True,
+                scp_result = self._run_gcloud_scp(
+                    self.startup_script,
+                    remote_setup,
+                    worker_index,
+                    phase="bootstrap",
+                    log_handle=lf,
                 )
                 if scp_result.returncode != 0:
-                    stderr = (scp_result.stderr or "").strip() or "SCP failed"
+                    stderr = self._extract_process_error(scp_result, "SCP failed")
                     results.append((worker_index, False, stderr))
-                    logger.warning("Bootstrap SCP failed on worker %d: %s", worker_index, stderr)
-                    self._record_timeline("scp_failed",
-                                          phase="bootstrap",
-                                          worker_index=worker_index,
-                                          returncode=scp_result.returncode,
-                                          error=stderr)
+                    record_bootstrap_result(worker_index, False, stderr)
                     preempted = preempted or self._is_preempted()
                     continue
 
                 setup_inline = f"chmod +x {remote_setup} && bash {remote_setup}"
                 if worker_index == 0:
                     if self.debug:
-                        proc = subprocess.Popen(
-                            self._ssh_cmd(worker_index, setup_inline),
+                        proc = self._popen_gcloud_ssh(
+                            worker_index, setup_inline,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             text=True,
@@ -278,53 +417,41 @@ class Worker:
                         tee_thread.start()
                         exit_code = proc.wait()
                         tee_thread.join()
-                        error_text = None
+                        error_text = "See console output above for merged gcloud ssh output." if exit_code != 0 else None
                     else:
-                        proc = subprocess.Popen(
-                            self._ssh_cmd(worker_index, setup_inline),
+                        proc = self._popen_gcloud_ssh(
+                            worker_index, setup_inline,
                             stdout=lf,
                             stderr=subprocess.STDOUT,
                             text=True,
                         )
                         exit_code = proc.wait()
-                        error_text = None
+                        error_text = "See bootstrap.log above for merged gcloud ssh output." if exit_code != 0 else None
                 else:
-                    result = subprocess.run(
-                        self._ssh_cmd(worker_index, setup_inline),
-                        capture_output=True,
-                        text=True,
+                    result = self._run_gcloud_ssh(
+                        worker_index,
+                        setup_inline,
+                        phase="bootstrap",
+                        log_handle=lf,
                     )
                     exit_code = result.returncode
-                    error_text = (result.stderr or result.stdout or "").strip() or None
+                    error_text = self._extract_process_error(result, "gcloud ssh failed") if exit_code != 0 else None
 
                 if exit_code != 0:
                     preempted = preempted or (exit_code == 255 and self._is_preempted())
                     results.append((worker_index, False, error_text))
-                    logger.warning("Bootstrap failed on worker %d with exit code %d",
-                                   worker_index, exit_code)
-                    self._record_timeline("ssh_failed",
-                                          phase="bootstrap",
-                                          worker_index=worker_index,
-                                          returncode=exit_code,
-                                          error=error_text)
+                    record_bootstrap_result(worker_index, False, error_text)
                 else:
                     results.append((worker_index, True, None))
+                    record_bootstrap_result(worker_index, True, None)
 
             if lf is not None:
                 lf.write("\n=== Bootstrap summary ===\n")
-                for worker_index, ok, error_text in results:
-                    status = "ok" if ok else "failed"
-                    lf.write(f"worker {worker_index}: {status}\n")
-                    if not ok and worker_index != 0 and error_text:
-                        lf.write(f"  detail: {error_text}\n")
                 success = all(ok for _, ok, _ in results)
                 lf.write(f"\n=== Bootstrap ended at {_now()}, success={success} ===\n\n")
                 lf.flush()
             elif self.debug:
                 print("=== Bootstrap summary ===")
-                for worker_index, ok, _ in results:
-                    status = "ok" if ok else "failed"
-                    print(f"worker {worker_index}: {status}")
                 print("")
 
             success = all(ok for _, ok, _ in results)
@@ -336,6 +463,39 @@ class Worker:
     # ------------------------------------------------------------------
     # Task execution
     # ------------------------------------------------------------------
+
+    def _send_task_notification(self, task: dict, event: str) -> None:
+        mail_user = task.get("mail_user")
+        mail_types = {str(v).upper() for v in task.get("mail_types", [])}
+        if not mail_user or event not in mail_types:
+            return
+
+        subject = f"[jobman-lite] {event} {task['id']} ({task.get('name', task['id'])})"
+        body = "\n".join([
+            f"event: {event}",
+            f"task_id: {task['id']}",
+            f"name: {task.get('name', task['id'])}",
+            f"status: {task.get('status', '-')}",
+            f"worker: {self.worker_id}",
+            f"accelerator: {task.get('accelerator', self.accelerator)}",
+            f"zone: {task.get('zone', self.zone)}",
+            f"run_count: {task.get('run_count', 0)}",
+            f"submitted: {task.get('submitted') or '-'}",
+            f"started: {task.get('started') or '-'}",
+            f"ended: {task.get('ended') or '-'}",
+        ])
+        try:
+            sent = send_brevo_email(
+                recipient=mail_user,
+                subject=subject,
+                text_content=body,
+                config_path=task.get("mail_config_path"),
+            )
+        except Exception as exc:
+            logger.warning("Failed to send %s email for task %s: %s", event, task["id"], exc)
+            return
+        if not sent:
+            logger.warning("Email notification %s for task %s was not sent", event, task["id"])
 
     def _run_task(self, task: dict) -> tuple[str, bool]:
         """Run a task. Returns (outcome, preempted)."""
@@ -351,17 +511,12 @@ class Worker:
         if control_state is not None:
             return control_state, False
         if self.debug:
-            scp_result = subprocess.run(
-                self._scp_cmd(script_path, remote_script, 0),
-                capture_output=False,
-                text=True,
+            output_buffer: list[str] = []
+            scp_result = self._run_gcloud_scp(
+                script_path, remote_script, 0, phase="task"
             )
             if scp_result.returncode != 0:
-                logger.error("SCP failed for task %s", task_id)
-                self._record_timeline("scp_failed",
-                                      phase="task",
-                                      task_id=task_id,
-                                      returncode=scp_result.returncode)
+                logger.error("SCP failed for task %s: %s", task_id, self._extract_process_error(scp_result, "SCP failed"))
                 if self._is_preempted():
                     return "failed", True
                 return "failed", False
@@ -375,13 +530,13 @@ class Worker:
             if control_state is not None:
                 return control_state, False
             inline = f"chmod +x {remote_script} && {env_str} bash {remote_script}"
-            proc = subprocess.Popen(
-                self._ssh_cmd(0, inline),
+            proc = self._popen_gcloud_ssh(
+                0, inline,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            tee_thread = threading.Thread(target=_tee_to_stdout, args=(proc,), daemon=True)
+            tee_thread = threading.Thread(target=_tee_to_stdout, args=(proc, output_buffer), daemon=True)
             tee_thread.start()
             exit_code, control_state = self._wait_for_task_process(proc, task_id)
             tee_thread.join()
@@ -399,23 +554,16 @@ class Worker:
                     f"TPU: {self.worker_id} ({self.zone})\n\n"
                 )
                 lf.flush()
-                scp_result = subprocess.run(
-                    self._scp_cmd(script_path, remote_script, 0),
-                    capture_output=True,
-                    text=True,
+                scp_result = self._run_gcloud_scp(
+                    script_path,
+                    remote_script,
+                    0,
+                    phase="task",
+                    log_handle=lf,
                 )
                 if scp_result.returncode != 0:
-                    logger.error("SCP failed for task %s: %s", task_id, scp_result.stderr)
-                    self._record_timeline("scp_failed",
-                                          phase="task",
-                                          task_id=task_id,
-                                          returncode=scp_result.returncode,
-                                          error=(scp_result.stderr or "").strip() or None)
-                    lf.write("=== SCP failed before remote execution ===\n")
-                    if scp_result.stderr:
-                        lf.write(scp_result.stderr)
-                        if not scp_result.stderr.endswith("\n"):
-                            lf.write("\n")
+                    detail = self._extract_process_error(scp_result, "SCP failed")
+                    logger.error("SCP failed for task %s: %s", task_id, detail)
                     lf.write(f"\n=== Task {task_id} ended at {_now()}, exit_code={scp_result.returncode} ===\n")
                     if self._is_preempted():
                         return "failed", True
@@ -431,8 +579,8 @@ class Worker:
                     lf.write(f"=== Task {task_id} externally {control_state} before remote execution ===\n")
                     return control_state, False
                 inline = f"chmod +x {remote_script} && {env_str} bash {remote_script}"
-                proc = subprocess.Popen(
-                    self._ssh_cmd(0, inline),
+                proc = self._popen_gcloud_ssh(
+                    0, inline,
                     stdout=lf,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -442,6 +590,17 @@ class Worker:
                 if control_state is not None:
                     lf.write(f"=== Task {task_id} externally {control_state} during execution ===\n")
                     return control_state, False
+
+        pattern_detected = False
+        if exit_code == 0:
+            if self.debug:
+                pattern_detected = self._has_retryable_failure_pattern(text="".join(output_buffer))
+            else:
+                pattern_detected = self._has_retryable_failure_pattern(log_file=log_file)
+            if pattern_detected:
+                logger.warning("Task %s matched retryable failure pattern despite exit code 0", task_id)
+                self._record_timeline("task_retryable_pattern_detected", task_id=task_id)
+                return "failed", False
 
         if exit_code == 255:
             # Possible preemption
@@ -492,11 +651,22 @@ class Worker:
                 return exit_code, control_state
             time.sleep(self._TASK_CONTROL_POLL_INTERVAL)
 
+    def _has_retryable_failure_pattern(self, text: str = "", log_file: str = "") -> bool:
+        if text:
+            return _RETRYABLE_FAILURE_PATTERN in text
+        if log_file and os.path.exists(log_file):
+            try:
+                with open(log_file) as f:
+                    return _RETRYABLE_FAILURE_PATTERN in f.read()
+            except OSError:
+                logger.warning("Failed to read task log %s for retryable failure detection", log_file)
+        return False
+
     def _is_preempted(self) -> bool:
         status = self.tpu.status()
-        if status in ("PREEMPTED", "TERMINATED", "NOT_FOUND", "SUSPENDED"):
+        if status in ("PREEMPTED", "TERMINATED", "NOT_FOUND", "SUSPENDED", "FAILED"):
             self._record_timeline("tpu_unavailable", status=status)
-        return status in ("PREEMPTED", "TERMINATED", "NOT_FOUND", "SUSPENDED")
+        return status in ("PREEMPTED", "TERMINATED", "NOT_FOUND", "SUSPENDED", "FAILED")
 
     def _record_timeline(self, event: str, **fields) -> None:
         entry = {"time": _now(), "event": event, "worker_id": self.worker_id}

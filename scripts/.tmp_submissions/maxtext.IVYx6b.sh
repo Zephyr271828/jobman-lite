@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-#JOBMAN --accelerator=v4-16
+#JOBMAN --accelerator=v4-128
 #JOBMAN --zone=us-central2-b
-#JOBMAN --name=maxtext-train
+#JOBMAN --name=llama3.1-4b-depth-scratch-s10-lr-1e-4
 #JOBMAN --max-retries=3
-#JOBMAN --mail-user=yx3038@nyu.edu
-#JOBMAN --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 
@@ -15,7 +13,7 @@ VENV_NAME="maxtext_env"
 VENV_DIR="$HOME/.venvs/$VENV_NAME"
 LOG_PREFIX="[jobman-task]"
 
-TRAIN_CMD="bash scripts/llama3.1-4b-depth/S10.sh --lr=3e-4"
+TRAIN_CMD="bash scripts/llama3.1-4b-depth/S10.sh --lr=1e-4"
 
 log() {
   printf '%s %s %s\n' "$(date -Is)" "$LOG_PREFIX" "$*"
