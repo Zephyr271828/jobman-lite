@@ -11,14 +11,20 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from .queue import Queue
 from .tpu import TPU, AllocationMode, Pricing, DEFAULT_TPU_VERSION
-from .utils import get_logger, jobman_dir, jobman_log_dir, send_brevo_email
+from .utils import dir_lock, get_logger, jobman_dir, jobman_log_dir, send_brevo_email
 
 logger = get_logger(__name__)
 _RETRYABLE_FAILURE_PATTERN = "Main command finished with errors, check the logs located in"
+_WORKER_DISCONNECT_PATTERNS = (
+    "client_loop: send disconnect: Broken pipe",
+    "Connection timed out during banner exchange",
+    "lost connection",
+)
 
 
 def _now() -> str:
@@ -34,9 +40,44 @@ def _tee_to_stdout(proc, buffer: list[str] | None = None) -> None:
         sys.stdout.flush()
 
 
+class _OutputActivityTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_output_time = time.monotonic()
+
+    def mark_output(self) -> None:
+        with self._lock:
+            self._last_output_time = time.monotonic()
+
+    def seconds_since_output(self) -> float:
+        with self._lock:
+            return time.monotonic() - self._last_output_time
+
+
+def _stream_process_output(
+    proc: subprocess.Popen,
+    *,
+    target=None,
+    buffer: list[str] | None = None,
+    activity_tracker: _OutputActivityTracker | None = None,
+) -> None:
+    """Drain proc.stdout, teeing into a target and tracking last output time."""
+    if proc.stdout is None:
+        return
+    for line in proc.stdout:
+        if activity_tracker is not None:
+            activity_tracker.mark_output()
+        if buffer is not None:
+            buffer.append(line)
+        if target is not None:
+            target.write(line)
+            target.flush()
+
+
 class Worker:
     _TASK_CONTROL_POLL_INTERVAL = 5
     _LOOP_ERROR_SLEEP_SECS = 10
+    _DEFAULT_TASK_INACTIVITY_TIMEOUT_SECS = 600
 
     def __init__(
         self,
@@ -48,12 +89,15 @@ class Worker:
         allocation_mode: AllocationMode = "tpu-vm",
         startup_script: str | None = None,
         debug: bool = False,
+        ssh_user: str | None = None,
     ):
         self.worker_id = tpu_name
         self.accelerator = accelerator
         self.zone = zone
         self.debug = debug
+        self.ssh_user = ssh_user
         self.startup_script = startup_script
+        self._startup_script_snapshot = startup_script
         self.tpu = TPU(
             tpu_name,
             zone,
@@ -68,6 +112,7 @@ class Worker:
         self._log_dir = os.path.join(jobman_log_dir(), "workers", tpu_name)
         self._timeline_path = os.path.join(self._log_dir, "timeline.jsonl")
         self._bootstrap_complete = False
+        self._task_inactivity_timeout_secs = self._load_task_inactivity_timeout_secs()
         os.makedirs(self._log_dir, exist_ok=True)
         if self.startup_script:
             self._snapshot_startup_script()
@@ -84,6 +129,23 @@ class Worker:
                 if name.startswith("jobman"):
                     logging.getLogger(name).setLevel(logging.DEBUG)
 
+    def _load_task_inactivity_timeout_secs(self) -> int | None:
+        raw = os.environ.get("JOBMAN_TASK_INACTIVITY_TIMEOUT_SECS")
+        if raw is None:
+            return self._DEFAULT_TASK_INACTIVITY_TIMEOUT_SECS
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid JOBMAN_TASK_INACTIVITY_TIMEOUT_SECS=%r; using default %s",
+                raw,
+                self._DEFAULT_TASK_INACTIVITY_TIMEOUT_SECS,
+            )
+            return self._DEFAULT_TASK_INACTIVITY_TIMEOUT_SECS
+        if value <= 0:
+            return None
+        return value
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -93,20 +155,29 @@ class Worker:
         if not src:
             return
         dst = os.path.join(self._log_dir, os.path.basename(src))
+        self._startup_script_snapshot = dst
         if os.path.exists(dst):
             return
         try:
             shutil.copy2(src, dst)
         except OSError:
+            self._startup_script_snapshot = src
             logger.warning("Failed to snapshot startup script %s into %s", src, dst, exc_info=True)
+
+    def _display_startup_script(self) -> str | None:
+        return self._startup_script_snapshot or self.startup_script
 
     def run(self) -> None:
         self._register(status="running")
-        self._record_timeline("worker_started",
-                              accelerator=self.accelerator,
-                              zone=self.zone,
-                              pricing=self.tpu.pricing,
-                              allocation_mode=self.tpu.mode)
+        timeline_fields = dict(
+            accelerator=self.accelerator,
+            zone=self.zone,
+            pricing=self.tpu.pricing,
+            allocation_mode=self.tpu.mode,
+        )
+        if self.ssh_user:
+            timeline_fields["ssh_user"] = self.ssh_user
+        self._record_timeline("worker_started", **timeline_fields)
         logger.info("Worker %s started (accelerator=%s, zone=%s)",
                     self.worker_id, self.accelerator, self.zone)
         try:
@@ -192,6 +263,13 @@ class Worker:
             self._record_timeline("tpu_delete_requested", reason=f"status={status}")
             self.tpu.delete()
             self._record_timeline("tpu_deleted", reason=f"status={status}")
+            # Verify the resource is actually gone before creating a new one
+            post_delete_status = self.tpu.status()
+            if post_delete_status not in ("NOT_FOUND", "UNKNOWN"):
+                raise RuntimeError(
+                    f"TPU {self.worker_id} still exists after delete "
+                    f"(status={post_delete_status}); refusing to create duplicate"
+                )
         if status != "CREATING":
             self._record_timeline("tpu_requesting")
             self.tpu.request()
@@ -210,11 +288,16 @@ class Worker:
             logger.warning("Error deleting preempted TPU: %s", e)
             self._record_timeline("tpu_delete_failed", reason="preemption_recovery", error=str(e))
 
+    def _ssh_target(self) -> str:
+        if self.ssh_user:
+            return f"{self.ssh_user}@{self.worker_id}"
+        return self.worker_id
+
     def _scp_cmd(self, local_path: str, remote_path: str, worker_index: int) -> list[str]:
         return [
             "gcloud", "compute", "tpus", "tpu-vm", "scp",
             local_path,
-            f"{self.worker_id}:{remote_path}",
+            f"{self._ssh_target()}:{remote_path}",
             f"--zone={self.zone}",
             f"--worker={worker_index}",
             "--scp-flag=-o ConnectionAttempts=2",
@@ -226,7 +309,7 @@ class Worker:
 
     def _ssh_cmd(self, worker_index: int, inline: str) -> list[str]:
         return [
-            "gcloud", "compute", "tpus", "tpu-vm", "ssh", self.worker_id,
+            "gcloud", "compute", "tpus", "tpu-vm", "ssh", self._ssh_target(),
             f"--zone={self.zone}",
             f"--worker={worker_index}",
             "--ssh-flag=-o ConnectionAttempts=2",
@@ -340,13 +423,14 @@ class Worker:
         if self._bootstrap_complete or not self.startup_script:
             return True, False
         success, preempted = self._run_bootstrap(self.tpu.get_num_workers())
+        display_script = self._display_startup_script()
         if success:
             self._bootstrap_complete = True
-            self._record_timeline("bootstrap_succeeded", script=self.startup_script)
+            self._record_timeline("bootstrap_succeeded", script=display_script)
             logger.info("Worker bootstrap completed for TPU %s", self.worker_id)
         else:
             self._record_timeline("bootstrap_failed",
-                                  script=self.startup_script,
+                                  script=display_script,
                                   preempted=preempted)
         return success, preempted
 
@@ -355,10 +439,11 @@ class Worker:
             return True, False
 
         remote_setup = "/tmp/jobman_worker_setup.sh"
+        display_script = self._display_startup_script()
         self._record_timeline("bootstrap_started",
-                              script=self.startup_script,
+                              script=display_script,
                               num_workers=num_workers)
-        logger.info("Running worker bootstrap on %d TPU hosts: %s", num_workers, self.startup_script)
+        logger.info("Running worker bootstrap on %d TPU hosts: %s", num_workers, display_script)
 
         lf = None
         if not self.debug:
@@ -366,90 +451,187 @@ class Worker:
             lf = open(bootstrap_log, "w")
             lf.write(
                 f"=== Bootstrap started at {_now()} ===\n"
-                f"Script: {self.startup_script}\n"
+                f"Script: {display_script}\n"
                 f"TPU: {self.worker_id} ({self.zone})\n\n"
             )
             lf.flush()
         else:
-            print(f"=== Bootstrap phase: {self.startup_script} ===")
+            print(f"=== Bootstrap phase: {display_script} ===")
 
-        results: list[tuple[int, bool, str | None]] = []
+        results: list[tuple[int, bool, str | None] | None] = [None] * num_workers
         preempted = False
+        result_lock = threading.Lock()
+        log_lock = threading.Lock()
+
+        class _SynchronizedLogHandle:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def write(self, data: str) -> int:
+                with log_lock:
+                    return self._handle.write(data)
+
+            def flush(self) -> None:
+                with log_lock:
+                    self._handle.flush()
+
+            def fileno(self) -> int:
+                return self._handle.fileno()
+
+        thread_safe_lf = _SynchronizedLogHandle(lf) if lf is not None else None
 
         def record_bootstrap_result(worker_index: int, ok: bool, error_text: str | None = None) -> None:
             status = "ok" if ok else "failed"
-            if lf is not None:
-                lf.write(f"worker {worker_index}: {status}\n")
+            if thread_safe_lf is not None:
+                thread_safe_lf.write(f"worker {worker_index}: {status}\n")
                 if error_text:
-                    lf.write(f"  detail: {error_text}\n")
-                lf.flush()
+                    thread_safe_lf.write(f"  detail: {error_text}\n")
+                thread_safe_lf.flush()
             elif self.debug:
                 print(f"worker {worker_index}: {status}")
                 if error_text:
                     print(f"  detail: {error_text}")
 
-        try:
-            for worker_index in range(num_workers):
-                scp_result = self._run_gcloud_scp(
-                    self.startup_script,
-                    remote_setup,
-                    worker_index,
-                    phase="bootstrap",
-                    log_handle=lf,
-                )
-                if scp_result.returncode != 0:
-                    stderr = self._extract_process_error(scp_result, "SCP failed")
-                    results.append((worker_index, False, stderr))
-                    record_bootstrap_result(worker_index, False, stderr)
-                    preempted = preempted or self._is_preempted()
-                    continue
+        def record_ssh_check_result(worker_index: int, ok: bool, error_text: str | None = None) -> None:
+            status = "ok" if ok else "failed"
+            if thread_safe_lf is not None:
+                thread_safe_lf.write(f"ssh-check worker {worker_index}: {status}\n")
+                if error_text:
+                    thread_safe_lf.write(f"  detail: {error_text}\n")
+                thread_safe_lf.flush()
+            elif self.debug:
+                print(f"ssh-check worker {worker_index}: {status}")
+                if error_text:
+                    print(f"  detail: {error_text}")
 
-                setup_inline = f"chmod +x {remote_setup} && bash {remote_setup}"
-                if worker_index == 0:
-                    if self.debug:
-                        proc = self._popen_gcloud_ssh(
-                            worker_index, setup_inline,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                        )
-                        tee_thread = threading.Thread(target=_tee_to_stdout, args=(proc,), daemon=True)
-                        tee_thread.start()
-                        exit_code = proc.wait()
-                        tee_thread.join()
-                        error_text = "See console output above for merged gcloud ssh output." if exit_code != 0 else None
-                    else:
-                        proc = self._popen_gcloud_ssh(
-                            worker_index, setup_inline,
-                            stdout=lf,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                        )
-                        exit_code = proc.wait()
-                        error_text = "See bootstrap.log above for merged gcloud ssh output." if exit_code != 0 else None
-                else:
-                    result = self._run_gcloud_ssh(
-                        worker_index,
-                        setup_inline,
-                        phase="bootstrap",
-                        log_handle=lf,
+        def log_handle_for_worker(worker_index: int):
+            if worker_index == 0:
+                return thread_safe_lf
+            return thread_safe_lf
+
+        def run_ssh_check_for_worker(worker_index: int) -> tuple[bool, str | None, bool]:
+            worker_log_handle = log_handle_for_worker(worker_index)
+            result = self._run_gcloud_ssh(
+                worker_index,
+                "true",
+                phase="bootstrap_ssh_check",
+                log_handle=worker_log_handle,
+            )
+            if result.returncode != 0:
+                error_text = self._extract_process_error(result, "gcloud ssh failed")
+                worker_preempted = result.returncode == 255 and self._is_preempted()
+                return False, error_text, worker_preempted
+            return True, None, False
+
+        def run_bootstrap_for_worker(worker_index: int) -> tuple[bool, str | None, bool]:
+            worker_log_handle = log_handle_for_worker(worker_index)
+            scp_result = self._run_gcloud_scp(
+                self.startup_script,
+                remote_setup,
+                worker_index,
+                phase="bootstrap",
+                log_handle=worker_log_handle,
+            )
+            if scp_result.returncode != 0:
+                stderr = self._extract_process_error(scp_result, "SCP failed")
+                return False, stderr, self._is_preempted()
+
+            setup_inline = f"chmod +x {remote_setup} && bash {remote_setup}"
+            if worker_index == 0:
+                if self.debug:
+                    proc = self._popen_gcloud_ssh(
+                        worker_index, setup_inline,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
                     )
-                    exit_code = result.returncode
-                    error_text = self._extract_process_error(result, "gcloud ssh failed") if exit_code != 0 else None
-
-                if exit_code != 0:
-                    preempted = preempted or (exit_code == 255 and self._is_preempted())
-                    results.append((worker_index, False, error_text))
-                    record_bootstrap_result(worker_index, False, error_text)
+                    tee_thread = threading.Thread(target=_tee_to_stdout, args=(proc,), daemon=True)
+                    tee_thread.start()
+                    exit_code = proc.wait()
+                    tee_thread.join()
+                    error_text = "See console output above for merged gcloud ssh output." if exit_code != 0 else None
                 else:
-                    results.append((worker_index, True, None))
-                    record_bootstrap_result(worker_index, True, None)
+                    proc = self._popen_gcloud_ssh(
+                        worker_index, setup_inline,
+                        stdout=thread_safe_lf,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    exit_code = proc.wait()
+                    error_text = "See bootstrap.log above for merged gcloud ssh output." if exit_code != 0 else None
+            else:
+                result = self._run_gcloud_ssh(
+                    worker_index,
+                    setup_inline,
+                    phase="bootstrap",
+                    log_handle=worker_log_handle,
+                )
+                exit_code = result.returncode
+                error_text = self._extract_process_error(result, "gcloud ssh failed") if exit_code != 0 else None
 
-            if lf is not None:
-                lf.write("\n=== Bootstrap summary ===\n")
-                success = all(ok for _, ok, _ in results)
-                lf.write(f"\n=== Bootstrap ended at {_now()}, success={success} ===\n\n")
-                lf.flush()
+            worker_preempted = exit_code == 255 and self._is_preempted()
+            return exit_code == 0, error_text, worker_preempted
+
+        try:
+            max_workers = max(1, num_workers)
+            ssh_check_results: list[tuple[int, bool, str | None] | None] = [None] * num_workers
+
+            def ssh_check_task(worker_index: int) -> None:
+                nonlocal preempted
+                ok, error_text, worker_preempted = run_ssh_check_for_worker(worker_index)
+                with result_lock:
+                    ssh_check_results[worker_index] = (worker_index, ok, error_text)
+                    preempted = preempted or worker_preempted
+
+            if thread_safe_lf is not None:
+                thread_safe_lf.write("=== SSH reachability check ===\n")
+                thread_safe_lf.flush()
+            elif self.debug:
+                print("=== SSH reachability check ===")
+
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="jobman-bootstrap-ssh-check") as executor:
+                futures = [executor.submit(ssh_check_task, worker_index) for worker_index in range(num_workers)]
+                for future in futures:
+                    future.result()
+
+            for result in ssh_check_results:
+                assert result is not None
+                worker_index, ok, error_text = result
+                record_ssh_check_result(worker_index, ok, error_text)
+
+            ssh_check_success = all(result is not None and result[1] for result in ssh_check_results)
+            if not ssh_check_success:
+                if thread_safe_lf is not None:
+                    thread_safe_lf.write("\n=== Bootstrap summary ===\n")
+                    thread_safe_lf.write(f"\n=== Bootstrap ended at {_now()}, success=False ===\n\n")
+                    thread_safe_lf.flush()
+                elif self.debug:
+                    print("=== Bootstrap summary ===")
+                    print("")
+                return False, preempted
+
+            def worker_task(worker_index: int) -> None:
+                nonlocal preempted
+                ok, error_text, worker_preempted = run_bootstrap_for_worker(worker_index)
+                with result_lock:
+                    results[worker_index] = (worker_index, ok, error_text)
+                    preempted = preempted or worker_preempted
+
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="jobman-bootstrap") as executor:
+                futures = [executor.submit(worker_task, worker_index) for worker_index in range(num_workers)]
+                for future in futures:
+                    future.result()
+
+            for result in results:
+                assert result is not None
+                worker_index, ok, error_text = result
+                record_bootstrap_result(worker_index, ok, error_text)
+
+            if thread_safe_lf is not None:
+                thread_safe_lf.write("\n=== Bootstrap summary ===\n")
+                success = all(result is not None and result[1] for result in results)
+                thread_safe_lf.write(f"\n=== Bootstrap ended at {_now()}, success={success} ===\n\n")
+                thread_safe_lf.flush()
             elif self.debug:
                 print("=== Bootstrap summary ===")
                 print("")
@@ -512,6 +694,7 @@ class Worker:
             return control_state, False
         if self.debug:
             output_buffer: list[str] = []
+            activity_tracker = _OutputActivityTracker()
             scp_result = self._run_gcloud_scp(
                 script_path, remote_script, 0, phase="task"
             )
@@ -536,11 +719,24 @@ class Worker:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            tee_thread = threading.Thread(target=_tee_to_stdout, args=(proc, output_buffer), daemon=True)
+            tee_thread = threading.Thread(
+                target=_stream_process_output,
+                kwargs={
+                    "proc": proc,
+                    "target": sys.stdout,
+                    "buffer": output_buffer,
+                    "activity_tracker": activity_tracker,
+                },
+                daemon=True,
+            )
             tee_thread.start()
-            exit_code, control_state = self._wait_for_task_process(proc, task_id)
+            exit_code, control_state = self._wait_for_task_process(proc, task_id, activity_tracker)
             tee_thread.join()
             if control_state is not None:
+                if control_state == "failed":
+                    if self._is_preempted():
+                        return "failed", True
+                    return "failed", False
                 return control_state, False
         else:
             log_dir = os.path.join(self._task_log_root, task_id)
@@ -579,15 +775,32 @@ class Worker:
                     lf.write(f"=== Task {task_id} externally {control_state} before remote execution ===\n")
                     return control_state, False
                 inline = f"chmod +x {remote_script} && {env_str} bash {remote_script}"
+                activity_tracker = _OutputActivityTracker()
                 proc = self._popen_gcloud_ssh(
                     0, inline,
-                    stdout=lf,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                 )
-                exit_code, control_state = self._wait_for_task_process(proc, task_id)
+                tee_thread = threading.Thread(
+                    target=_stream_process_output,
+                    kwargs={
+                        "proc": proc,
+                        "target": lf,
+                        "activity_tracker": activity_tracker,
+                    },
+                    daemon=True,
+                )
+                tee_thread.start()
+                exit_code, control_state = self._wait_for_task_process(proc, task_id, activity_tracker)
+                tee_thread.join()
                 lf.write(f"\n=== Task {task_id} ended at {_now()}, exit_code={exit_code} ===\n")
                 if control_state is not None:
+                    if control_state == "failed":
+                        lf.write(f"=== Task {task_id} terminated due to inactivity timeout ===\n")
+                        if self._is_preempted():
+                            return "failed", True
+                        return "failed", False
                     lf.write(f"=== Task {task_id} externally {control_state} during execution ===\n")
                     return control_state, False
 
@@ -601,6 +814,16 @@ class Worker:
                 logger.warning("Task %s matched retryable failure pattern despite exit code 0", task_id)
                 self._record_timeline("task_retryable_pattern_detected", task_id=task_id)
                 return "failed", False
+
+        disconnect_detected = False
+        if self.debug:
+            disconnect_detected = self._has_worker_disconnect_pattern(text="".join(output_buffer))
+        else:
+            disconnect_detected = self._has_worker_disconnect_pattern(log_file=log_file)
+        if disconnect_detected:
+            logger.warning("Task %s matched worker disconnect pattern; treating as interrupted", task_id)
+            self._record_timeline("task_worker_disconnect_detected", task_id=task_id)
+            return "failed", True
 
         if exit_code == 255:
             # Possible preemption
@@ -640,7 +863,12 @@ class Worker:
             proc.kill()
             return proc.wait()
 
-    def _wait_for_task_process(self, proc: subprocess.Popen, task_id: str) -> tuple[int, str | None]:
+    def _wait_for_task_process(
+        self,
+        proc: subprocess.Popen,
+        task_id: str,
+        activity_tracker: _OutputActivityTracker | None = None,
+    ) -> tuple[int, str | None]:
         while True:
             exit_code = proc.poll()
             if exit_code is not None:
@@ -649,6 +877,23 @@ class Worker:
             if control_state is not None:
                 exit_code = self._terminate_task_process(proc, task_id, control_state)
                 return exit_code, control_state
+            if (
+                activity_tracker is not None
+                and self._task_inactivity_timeout_secs is not None
+                and activity_tracker.seconds_since_output() > self._task_inactivity_timeout_secs
+            ):
+                logger.warning(
+                    "Task %s had no new output for %ss; terminating remote process",
+                    task_id,
+                    self._task_inactivity_timeout_secs,
+                )
+                self._record_timeline(
+                    "task_inactivity_timeout",
+                    task_id=task_id,
+                    timeout_secs=self._task_inactivity_timeout_secs,
+                )
+                exit_code = self._terminate_task_process(proc, task_id, "inactivity_timeout")
+                return exit_code, "failed"
             time.sleep(self._TASK_CONTROL_POLL_INTERVAL)
 
     def _has_retryable_failure_pattern(self, text: str = "", log_file: str = "") -> bool:
@@ -660,6 +905,18 @@ class Worker:
                     return _RETRYABLE_FAILURE_PATTERN in f.read()
             except OSError:
                 logger.warning("Failed to read task log %s for retryable failure detection", log_file)
+        return False
+
+    def _has_worker_disconnect_pattern(self, text: str = "", log_file: str = "") -> bool:
+        if text:
+            return any(pattern in text for pattern in _WORKER_DISCONNECT_PATTERNS)
+        if log_file and os.path.exists(log_file):
+            try:
+                with open(log_file) as f:
+                    content = f.read()
+                return any(pattern in content for pattern in _WORKER_DISCONNECT_PATTERNS)
+            except OSError:
+                logger.warning("Failed to read task log %s for worker disconnect detection", log_file)
         return False
 
     def _is_preempted(self) -> bool:
@@ -684,32 +941,36 @@ class Worker:
 
     def _register(self, status: str = "running") -> None:
         registry_path = os.path.join(self._state_dir, "workers.json")
+        lock_dir = registry_path + ".d.lock"
         os.makedirs(self._state_dir, exist_ok=True)
 
-        # Read existing
-        registry: dict = {}
-        if os.path.exists(registry_path):
-            try:
-                with open(registry_path) as f:
-                    registry = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
+        with dir_lock(lock_dir):
+            registry: dict = {}
+            if os.path.exists(registry_path):
+                try:
+                    with open(registry_path) as f:
+                        registry = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        registry[self.worker_id] = {
-            "worker_id": self.worker_id,
-            "tpu_name": self.worker_id,
-            "accelerator": self.accelerator,
-            "zone": self.zone,
-            "tpu_version": self.tpu.version,
-            "pricing": self.tpu.pricing,
-            "mode": self.tpu.mode,
-            "startup_script": self.startup_script,
-            "status": status,
-            "registered": _now(),
-            "pid": os.getpid(),
-        }
+            entry = {
+                "worker_id": self.worker_id,
+                "tpu_name": self.worker_id,
+                "accelerator": self.accelerator,
+                "zone": self.zone,
+                "tpu_version": self.tpu.version,
+                "pricing": self.tpu.pricing,
+                "mode": self.tpu.mode,
+                "startup_script": self._display_startup_script(),
+                "status": status,
+                "registered": _now(),
+                "pid": os.getpid(),
+            }
+            if self.ssh_user:
+                entry["ssh_user"] = self.ssh_user
+            registry[self.worker_id] = entry
 
-        tmp = registry_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(registry, f, indent=2)
-        os.replace(tmp, registry_path)
+            tmp = registry_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(registry, f, indent=2)
+            os.replace(tmp, registry_path)
