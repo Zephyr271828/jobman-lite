@@ -7,28 +7,25 @@ TMP_DIR="${SCRIPT_DIR}/.tmp_submissions"
 
 # Edit these arrays directly.
 ACCELS=(
-  # "v4-128"
+  "v6e-4"
   # "v6e-128"
-  "v5p-128"
 )
 
 ZONES=(
-  # "us-central2-b"
-  # "us-central1-b"
-  # "us-east5-b"
+#   "us-central2-b"
+  "us-central1-b"
+  "us-east5-b"
 )
 
 MODEL_TYPES=(
   # "llama3.1-4b-depth"
-  # "llama3.1-4b-width"
   "llama3.1-4b-flap"
-  # "llama3.1-8b"
 )
 
 PRETRAINS=(
-  # "scratch"
+#   "scratch"
   "meta"
-  # "l200"
+#   "l200"
 )
 
 LENGTHS=(
@@ -41,7 +38,7 @@ LENGTHS=(
 
 LRS=(
   "1e-4"
-  # "3e-4"
+#   "3e-4"
 )
 
 mkdir -p "$TMP_DIR"
@@ -61,8 +58,8 @@ for accel in "${ACCELS[@]}"; do
 
         for length in "${LENGTHS[@]}"; do
           for lr in "${LRS[@]}"; do
-            job_name="${model_type}-${pretrain}-s${length}-lr-${lr//./p}"
-            train_cmd="bash scripts/${model_type}/${prefix}S${length}.sh --lr=${lr}"
+            job_name="eval-${model_type}-${pretrain}-s${length}-lr-${lr//./p}"
+            train_cmd="bash scripts/eval/${model_type}/${prefix}S${length}.sh --lr=${lr}"
             tmp_script="$(mktemp "${TMP_DIR}/maxtext.XXXXXX.sh")"
 
             sed \
