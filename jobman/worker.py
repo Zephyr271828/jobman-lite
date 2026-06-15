@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -20,10 +21,20 @@ from .utils import dir_lock, get_logger, jobman_dir, jobman_log_dir, send_brevo_
 
 logger = get_logger(__name__)
 _RETRYABLE_FAILURE_PATTERN = "Main command finished with errors, check the logs located in"
+_REMOTE_LOG_DIR_RE = re.compile(r"check the logs located in:\s*(\S+)")
+_REMOTE_LOG_DIR_RUNNING_RE = re.compile(r"Running main command, logs located in:\s*(\S+)")
+_REMOTE_FAILED_WORKER_RE = re.compile(r"Main command failed on slice (\d+) worker (\d+)")
 _WORKER_DISCONNECT_PATTERNS = (
     "client_loop: send disconnect: Broken pipe",
     "Connection timed out during banner exchange",
     "lost connection",
+)
+_INFRA_FAILURE_PATTERNS = (
+    "DEADLINE_EXCEEDED",
+    "Barrier timed out",
+    "RESOURCE_EXHAUSTED",
+    "Out of memory",
+    "oom-kill",
 )
 
 
@@ -74,10 +85,151 @@ def _stream_process_output(
             target.flush()
 
 
+class _MidTaskHealthMonitor:
+    """Background thread that monitors TPU/host health during task execution."""
+
+    HEALTH_CHECK_INTERVAL_SECS = 60
+    MEMORY_PRESSURE_THRESHOLD_KB = 1_048_576  # 1 GB
+
+    def __init__(self, worker, task_id: str):
+        self._worker = worker
+        self._task_id = task_id
+        self._degraded = threading.Event()
+        self._reason = ""
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._monitor_loop,
+            daemon=True,
+            name=f"jobman-health-{task_id}",
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+    @property
+    def is_degraded(self) -> bool:
+        return self._degraded.is_set()
+
+    @property
+    def degradation_reason(self) -> str:
+        with self._lock:
+            return self._reason
+
+    def _set_degraded(self, reason: str) -> None:
+        with self._lock:
+            if self._reason:
+                return
+            self._reason = reason
+        self._degraded.set()
+        logger.warning(
+            "Mid-task health monitor detected degradation for task %s: %s",
+            self._task_id, reason,
+        )
+
+    def _monitor_loop(self) -> None:
+        while not self._stop.wait(timeout=self.HEALTH_CHECK_INTERVAL_SECS):
+            if self._degraded.is_set():
+                break
+            try:
+                self._check_tpu_health()
+                if self._degraded.is_set():
+                    break
+                self._check_host_memory()
+                if self._degraded.is_set():
+                    break
+                self._check_gcs_reachability()
+            except Exception as e:
+                logger.debug(
+                    "Health monitor check failed for task %s: %s",
+                    self._task_id, e,
+                )
+
+    def _check_tpu_health(self) -> None:
+        health = self._worker.tpu.health_status()
+        if health == "UNHEALTHY":
+            desc = self._worker.tpu.health_description() or "unknown"
+            self._set_degraded(f"tpu_unhealthy: {desc}")
+            self._worker._record_timeline(
+                "midtask_tpu_unhealthy",
+                task_id=self._task_id,
+                health_description=desc,
+            )
+
+    def _check_host_memory(self) -> None:
+        cmd = self._worker._ssh_cmd(
+            0, "awk '/MemAvailable/{print $2}' /proc/meminfo",
+        )
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("Memory check timed out for task %s", self._task_id)
+            return
+        if result.returncode != 0:
+            logger.debug("Memory check SSH failed for task %s", self._task_id)
+            return
+        try:
+            available_kb = int(result.stdout.strip())
+        except (ValueError, AttributeError):
+            return
+        if available_kb < self.MEMORY_PRESSURE_THRESHOLD_KB:
+            self._set_degraded(
+                f"host_memory_pressure: {available_kb}KB available "
+                f"(threshold: {self.MEMORY_PRESSURE_THRESHOLD_KB}KB)"
+            )
+            self._worker._record_timeline(
+                "midtask_memory_pressure",
+                task_id=self._task_id,
+                available_kb=available_kb,
+                threshold_kb=self.MEMORY_PRESSURE_THRESHOLD_KB,
+            )
+
+    def _check_gcs_reachability(self) -> None:
+        probe = (
+            "python3 -c \""
+            "import socket; "
+            "s=socket.create_connection(('storage.googleapis.com', 443), timeout=10); "
+            "s.close(); "
+            "print('OK')\""
+        )
+        cmd = self._worker._ssh_cmd(0, probe)
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            self._set_degraded("gcs_unreachable: probe timed out")
+            self._worker._record_timeline(
+                "midtask_gcs_unreachable",
+                task_id=self._task_id,
+                detail="probe timed out",
+            )
+            return
+        if result.returncode != 0 or "OK" not in (result.stdout or ""):
+            self._set_degraded(
+                f"gcs_unreachable: probe failed (rc={result.returncode})"
+            )
+            self._worker._record_timeline(
+                "midtask_gcs_unreachable",
+                task_id=self._task_id,
+                detail=f"probe failed (rc={result.returncode})",
+            )
+
+
 class Worker:
     _TASK_CONTROL_POLL_INTERVAL = 5
     _LOOP_ERROR_SLEEP_SECS = 10
-    _DEFAULT_TASK_INACTIVITY_TIMEOUT_SECS = 600
+    _DEFAULT_TASK_INACTIVITY_TIMEOUT_SECS = 1800
+    _PREFLIGHT_MEMORY_THRESHOLD_KB = 1_048_576  # 1 GB
+    _MAINTENANCE_BACKOFF_BASE_SECS = 60
+    _MAINTENANCE_BACKOFF_MAX_SECS = 1800  # 30 minutes
+    _MAINTENANCE_WINDOW_SECS = 3600  # 1 hour window for counting recent events
 
     def __init__(
         self,
@@ -90,6 +242,7 @@ class Worker:
         startup_script: str | None = None,
         debug: bool = False,
         ssh_user: str | None = None,
+        ssh_identity_files: list[str] | None = None,
     ):
         self.worker_id = tpu_name
         self.accelerator = accelerator
@@ -98,6 +251,7 @@ class Worker:
         self.ssh_user = ssh_user
         self.startup_script = startup_script
         self._startup_script_snapshot = startup_script
+        self.ssh_identity_files = list(ssh_identity_files or [])
         self.tpu = TPU(
             tpu_name,
             zone,
@@ -112,7 +266,13 @@ class Worker:
         self._log_dir = os.path.join(jobman_log_dir(), "workers", tpu_name)
         self._timeline_path = os.path.join(self._log_dir, "timeline.jsonl")
         self._bootstrap_complete = False
+        self._bootstrap_failures = 0
+        self._MAX_BOOTSTRAP_RETRIES = 3
         self._task_inactivity_timeout_secs = self._load_task_inactivity_timeout_secs()
+        self._HOST_HEALTH_CHECK_INTERVAL_SECS = 300  # check every 5 minutes
+        self._HOST_HEALTH_SSH_TIMEOUT = 10
+        self._last_host_health_check = 0.0
+        self._zone_maintenance_events: list[float] = []
         os.makedirs(self._log_dir, exist_ok=True)
         if self.startup_script:
             self._snapshot_startup_script()
@@ -188,11 +348,33 @@ class Worker:
                     bootstrap_success, bootstrap_preempted = self._ensure_bootstrap_ready()
                     if not bootstrap_success:
                         if bootstrap_preempted:
+                            self._bootstrap_failures = 0
                             self._handle_preemption()
                         else:
-                            logger.warning("Worker bootstrap failed on TPU %s; retrying in 30s",
-                                           self.worker_id)
-                            time.sleep(30)
+                            self._bootstrap_failures += 1
+                            if self._bootstrap_failures >= self._MAX_BOOTSTRAP_RETRIES:
+                                logger.warning(
+                                    "Bootstrap failed %d times on TPU %s; deleting and recreating",
+                                    self._bootstrap_failures, self.worker_id)
+                                self._record_timeline("bootstrap_max_retries_exceeded",
+                                                      failures=self._bootstrap_failures)
+                                self._bootstrap_failures = 0
+                                self._handle_preemption()
+                            else:
+                                logger.warning(
+                                    "Worker bootstrap failed on TPU %s (attempt %d/%d); retrying in 30s",
+                                    self.worker_id, self._bootstrap_failures, self._MAX_BOOTSTRAP_RETRIES)
+                                time.sleep(30)
+                        continue
+                    self._bootstrap_failures = 0
+                    # Re-check host health right before claiming so a worker
+                    # that went unhealthy after the last cached check stops
+                    # taking new tasks immediately.
+                    if not self._check_host_health(force=True):
+                        self._recreate_tpu(reason="host_health_check_failed")
+                        continue
+                    if not self._run_preflight_checks():
+                        self._recreate_tpu(reason="preflight_check_failed")
                         continue
                     task = self.queue.claim(self.accelerator, self.zone, self.worker_id)
                     if task is None:
@@ -200,21 +382,37 @@ class Worker:
                         time.sleep(30)
                         continue
 
+                    self._record_timeline(
+                        "task_started",
+                        task_id=task["id"],
+                        task_name=task.get("name", task["id"]),
+                    )
                     self._send_task_notification(task, "BEGIN")
                     outcome, failure_reason = self._run_task(task)
 
                     if outcome == "deleted":
+                        self._record_timeline("task_released", task_id=task["id"], reason="deleted")
                         logger.info("Task %s was deleted while running; skipping queue release", task["id"])
                         continue
                     if outcome == "paused":
+                        self._record_timeline("task_released", task_id=task["id"], reason="paused")
                         logger.info("Task %s was paused while running; leaving it paused", task["id"])
                         continue
                     if failure_reason in ("preempted", "infra"):
+                        self._record_timeline(
+                            "task_released",
+                            task_id=task["id"],
+                            reason=failure_reason,
+                        )
                         # Infrastructure failure — re-queue without burning a retry
                         self.queue.release(task["id"], "interrupted")
                         if failure_reason == "preempted":
                             self._handle_preemption()
                     else:
+                        self._record_timeline(
+                            "task_completed" if outcome == "done" else "task_failed",
+                            task_id=task["id"],
+                        )
                         final_task = self.queue.release(task["id"], "done" if outcome == "done" else "failed")
                         if outcome == "done":
                             self._send_task_notification(final_task or task, "END")
@@ -260,27 +458,288 @@ class Worker:
             return
         self._record_timeline("tpu_status", status=status)
         logger.info("TPU %s status=%s, provisioning...", self.worker_id, status)
-        if status not in ("NOT_FOUND", "CREATING"):
-            self._record_timeline("tpu_delete_requested", reason=f"status={status}")
-            self.tpu.delete()
-            self._record_timeline("tpu_deleted", reason=f"status={status}")
-            # Verify the resource is actually gone before creating a new one
-            post_delete_status = self.tpu.status()
-            if post_delete_status not in ("NOT_FOUND", "UNKNOWN"):
-                raise RuntimeError(
-                    f"TPU {self.worker_id} still exists after delete "
-                    f"(status={post_delete_status}); refusing to create duplicate"
-                )
-        if status != "CREATING":
-            self._record_timeline("tpu_requesting")
+        if status not in ("NOT_FOUND", "CREATING", "PROVISIONING", "WAITING_FOR_RESOURCES"):
+            self._recreate_tpu(reason=f"status={status}")
+            return
+        if status == "NOT_FOUND":
+            self._record_timeline("tpu_requesting", reason="status=NOT_FOUND")
             self.tpu.request()
-        self.tpu.wait_ready()
+        try:
+            self.tpu.wait_ready(
+                status_callback=lambda s: self._record_timeline("tpu_status", status=s)
+            )
+        except RuntimeError as exc:
+            if "UNHEALTHY" not in str(exc).upper():
+                raise
+            logger.warning("TPU %s became unhealthy while waiting for readiness: %s", self.worker_id, exc)
+            self._recreate_tpu(reason=f"wait_ready_unhealthy:{exc}")
+            return
         self._bootstrap_complete = False
+        self._last_host_health_check = 0.0
         self._record_timeline("tpu_ready")
+
+    def _recreate_tpu(self, *, reason: str) -> None:
+        # Check for maintenance before deleting (health info unavailable after delete)
+        is_maintenance = self._is_maintenance_event(reason)
+        if is_maintenance:
+            self._record_timeline("maintenance_event_detected",
+                                  zone=self.zone, reason=reason)
+
+        self._record_timeline("tpu_delete_requested", reason=reason)
+        self.tpu.delete()
+        self._record_timeline("tpu_deleted", reason=reason)
+        # Verify the resource is actually gone before creating a new one.
+        post_delete_status = self.tpu.status()
+        if post_delete_status not in ("NOT_FOUND", "UNKNOWN"):
+            raise RuntimeError(
+                f"TPU {self.worker_id} still exists after delete "
+                f"(status={post_delete_status}); refusing to create duplicate"
+            )
+
+        # Apply exponential backoff for maintenance events to avoid
+        # recreating in the same zone during a maintenance window.
+        if is_maintenance:
+            backoff = self._maintenance_backoff_secs()
+            self._record_timeline("maintenance_backoff",
+                                  zone=self.zone,
+                                  backoff_secs=backoff,
+                                  recent_events=len(self._zone_maintenance_events))
+            logger.info(
+                "Maintenance detected in zone %s (%d recent events); "
+                "backing off %ds before TPU recreation",
+                self.zone, len(self._zone_maintenance_events), backoff,
+            )
+            time.sleep(backoff)
+
+        self._record_timeline("tpu_requesting", reason=reason)
+        self.tpu.request()
+        try:
+            self.tpu.wait_ready(
+                status_callback=lambda s: self._record_timeline("tpu_status", status=s)
+            )
+        except RuntimeError as exc:
+            if "UNHEALTHY" not in str(exc).upper():
+                raise
+            logger.warning("TPU %s remained unhealthy after recreate attempt: %s", self.worker_id, exc)
+            self._record_timeline("tpu_delete_requested", reason=f"{reason}:retry")
+            self.tpu.delete()
+            self._record_timeline("tpu_deleted", reason=f"{reason}:retry")
+            self._record_timeline("tpu_requesting", reason=f"{reason}:retry")
+            self.tpu.request()
+            self.tpu.wait_ready(
+                status_callback=lambda s: self._record_timeline("tpu_status", status=s)
+            )
+        self._bootstrap_complete = False
+        self._last_host_health_check = 0.0
+        self._record_timeline("tpu_ready")
+
+    def _is_maintenance_event(self, reason: str) -> bool:
+        """Check if the current TPU recreation is due to a maintenance event."""
+        if "maintenance" in reason.lower():
+            return True
+        try:
+            desc = self.tpu.health_description()
+            if isinstance(desc, str) and "maintenance" in desc.lower():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _maintenance_backoff_secs(self) -> int:
+        """Calculate exponential backoff based on recent maintenance events in this zone."""
+        now = time.time()
+        # Prune events older than the maintenance window
+        self._zone_maintenance_events = [
+            t for t in self._zone_maintenance_events
+            if now - t < self._MAINTENANCE_WINDOW_SECS
+        ]
+        # Record this event
+        self._zone_maintenance_events.append(now)
+        n = len(self._zone_maintenance_events)
+        return min(
+            self._MAINTENANCE_BACKOFF_BASE_SECS * (2 ** (n - 1)),
+            self._MAINTENANCE_BACKOFF_MAX_SECS,
+        )
+
+    def _check_host_health(self, *, force: bool = False) -> bool:
+        """Check SSH reachability of all TPU hosts. Returns True if all healthy."""
+        now = time.monotonic()
+        if not force and now - self._last_host_health_check < self._HOST_HEALTH_CHECK_INTERVAL_SECS:
+            return True
+        self._last_host_health_check = now
+
+        num_workers = self.tpu.get_num_workers()
+        if num_workers <= 1:
+            return True
+
+        logger.info("Running host health check on %d workers for TPU %s", num_workers, self.worker_id)
+        failed_workers: list[int] = []
+        lock = threading.Lock()
+
+        def check_worker(worker_index: int) -> None:
+            result = subprocess.run(
+                self._ssh_cmd(worker_index, "true"),
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                with lock:
+                    failed_workers.append(worker_index)
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=num_workers,
+                thread_name_prefix="jobman-health-check",
+            ) as executor:
+                futures = [executor.submit(check_worker, i) for i in range(num_workers)]
+                for f in futures:
+                    f.result()
+        except Exception as e:
+            logger.warning("Host health check failed with exception: %s", e)
+            return True  # don't act on check failures themselves
+
+        if failed_workers:
+            failed_workers.sort()
+            logger.warning(
+                "Host health check FAILED: %d/%d workers unreachable on TPU %s: %s",
+                len(failed_workers), num_workers, self.worker_id, failed_workers,
+            )
+            self._record_timeline(
+                "host_health_check_failed",
+                unreachable_workers=failed_workers,
+                total_workers=num_workers,
+            )
+            return False
+
+        logger.info("Host health check passed: all %d workers reachable", num_workers)
+        return True
+
+    def _run_preflight_checks(self) -> bool:
+        """Run pre-flight checks on all workers before claiming a task.
+
+        For multi-host pods, verifies on each worker:
+        - Coordination endpoint reachability (GCE metadata server)
+        - Available host memory exceeds threshold
+        - GCS connectivity (storage.googleapis.com:443)
+
+        Returns True if all checks pass, False otherwise.
+        Single-host pods skip these checks.
+        """
+        num_workers = self.tpu.get_num_workers()
+        if num_workers <= 1:
+            return True
+
+        logger.info(
+            "Running pre-flight checks on %d workers for TPU %s",
+            num_workers, self.worker_id,
+        )
+
+        failures: list[tuple[int, str]] = []
+        lock = threading.Lock()
+
+        def check_worker(worker_index: int) -> None:
+            # 1. Coordination endpoint (GCE metadata server as proxy)
+            coord_probe = (
+                "python3 -c \""
+                "import urllib.request; "
+                "r = urllib.request.Request("
+                "'http://metadata.google.internal/computeMetadata/v1/instance/hostname', "
+                "headers={'Metadata-Flavor': 'Google'}); "
+                "urllib.request.urlopen(r, timeout=5).read(); "
+                "print('OK')\""
+            )
+            cmd = self._ssh_cmd(worker_index, coord_probe)
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                with lock:
+                    failures.append((worker_index, "coordination_timeout"))
+                return
+            if result.returncode != 0 or "OK" not in (result.stdout or ""):
+                with lock:
+                    failures.append((worker_index, "coordination_unreachable"))
+                return
+
+            # 2. Available host memory
+            mem_cmd = self._ssh_cmd(
+                worker_index, "awk '/MemAvailable/{print $2}' /proc/meminfo",
+            )
+            try:
+                result = subprocess.run(
+                    mem_cmd, capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                with lock:
+                    failures.append((worker_index, "memory_check_timeout"))
+                return
+            if result.returncode == 0:
+                try:
+                    available_kb = int(result.stdout.strip())
+                    if available_kb < self._PREFLIGHT_MEMORY_THRESHOLD_KB:
+                        with lock:
+                            failures.append((
+                                worker_index,
+                                f"low_memory:{available_kb}KB<{self._PREFLIGHT_MEMORY_THRESHOLD_KB}KB",
+                            ))
+                        return
+                except (ValueError, AttributeError):
+                    pass
+
+            # 3. GCS connectivity
+            gcs_probe = (
+                "python3 -c \""
+                "import socket; "
+                "s=socket.create_connection(('storage.googleapis.com', 443), timeout=10); "
+                "s.close(); "
+                "print('OK')\""
+            )
+            gcs_cmd = self._ssh_cmd(worker_index, gcs_probe)
+            try:
+                result = subprocess.run(
+                    gcs_cmd, capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                with lock:
+                    failures.append((worker_index, "gcs_timeout"))
+                return
+            if result.returncode != 0 or "OK" not in (result.stdout or ""):
+                with lock:
+                    failures.append((worker_index, "gcs_unreachable"))
+                return
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=num_workers,
+                thread_name_prefix="jobman-preflight",
+            ) as executor:
+                futs = [executor.submit(check_worker, i) for i in range(num_workers)]
+                for f in futs:
+                    f.result()
+        except Exception as e:
+            logger.warning("Pre-flight check runner failed: %s", e)
+            return True  # Don't block on check infrastructure failures
+
+        if failures:
+            failures.sort()
+            logger.warning(
+                "Pre-flight checks FAILED on TPU %s: %s",
+                self.worker_id, failures,
+            )
+            self._record_timeline(
+                "preflight_check_failed",
+                failures=[(w, r) for w, r in failures],
+                total_workers=num_workers,
+            )
+            return False
+
+        logger.info("Pre-flight checks passed: all %d workers ready", num_workers)
+        return True
 
     def _handle_preemption(self) -> None:
         logger.info("Handling preemption for TPU %s", self.worker_id)
         self._bootstrap_complete = False
+        self._last_host_health_check = 0.0
         try:
             self._record_timeline("tpu_delete_requested", reason="preemption_recovery")
             self.tpu.delete()
@@ -439,7 +898,7 @@ class Worker:
         if not self.startup_script:
             return True, False
 
-        remote_setup = "/tmp/jobman_worker_setup.sh"
+        remote_setup = "~/jobman_worker_setup.sh"
         display_script = self._display_startup_script()
         self._record_timeline("bootstrap_started",
                               script=display_script,
@@ -695,10 +1154,11 @@ class Worker:
 
         num_workers = self.tpu.get_num_workers()
         script_path = task["script"]
-        remote_script = f"/tmp/jobman_{task_id}.sh"
+        remote_script = f"~/jobman_{task_id}.sh"
         control_state = self._task_control_state(task_id)
         if control_state is not None:
             return control_state, None
+        health_monitor = _MidTaskHealthMonitor(self, task_id)
         if self.debug:
             output_buffer: list[str] = []
             activity_tracker = _OutputActivityTracker()
@@ -717,6 +1177,7 @@ class Worker:
             control_state = self._task_control_state(task_id)
             if control_state is not None:
                 return control_state, None
+            health_monitor.start()
             inline = f"chmod +x {remote_script} && {env_str} bash {remote_script}"
             proc = self._popen_gcloud_ssh(
                 0, inline,
@@ -735,11 +1196,18 @@ class Worker:
                 daemon=True,
             )
             tee_thread.start()
-            exit_code, control_state = self._wait_for_task_process(proc, task_id, activity_tracker)
+            exit_code, control_state = self._wait_for_task_process(proc, task_id, activity_tracker, health_monitor)
             tee_thread.join()
+            health_monitor.stop()
             if control_state is not None:
                 if control_state == "failed":
-                    return "failed", "preempted" if self._is_preempted() else "infra"
+                    logger.warning(
+                        "Task %s terminated due to inactivity timeout; counting it as a task failure",
+                        task_id,
+                    )
+                    return "failed", "task"
+                if control_state == "health_degraded":
+                    return "failed", "infra"
                 return control_state, None
         else:
             log_dir = os.path.join(self._task_log_root, task_id)
@@ -775,6 +1243,7 @@ class Worker:
                 if control_state is not None:
                     lf.write(f"=== Task {task_id} externally {control_state} before remote execution ===\n")
                     return control_state, None
+                health_monitor.start()
                 inline = f"chmod +x {remote_script} && {env_str} bash {remote_script}"
                 activity_tracker = _OutputActivityTracker()
                 proc = self._popen_gcloud_ssh(
@@ -793,15 +1262,24 @@ class Worker:
                     daemon=True,
                 )
                 tee_thread.start()
-                exit_code, control_state = self._wait_for_task_process(proc, task_id, activity_tracker)
+                exit_code, control_state = self._wait_for_task_process(proc, task_id, activity_tracker, health_monitor)
                 tee_thread.join()
+                health_monitor.stop()
                 lf.write(f"\n=== Task {task_id} ended at {_now()}, exit_code={exit_code} ===\n")
                 if control_state is not None:
                     if control_state == "failed":
                         lf.write(f"=== Task {task_id} terminated due to inactivity timeout ===\n")
-                        return "failed", "preempted" if self._is_preempted() else "infra"
+                        logger.warning(
+                            "Task %s terminated due to inactivity timeout; counting it as a task failure",
+                            task_id,
+                        )
+                        return "failed", "task"
+                    if control_state == "health_degraded":
+                        lf.write(f"=== Task {task_id} terminated due to health degradation: {health_monitor.degradation_reason} ===\n")
+                        return "failed", "infra"
                     lf.write(f"=== Task {task_id} externally {control_state} during execution ===\n")
                     return control_state, None
+            self._collect_remote_error_logs(log_file, log_dir, run_count, num_workers, task_id)
 
         pattern_detected = False
         if exit_code == 0:
@@ -810,9 +1288,13 @@ class Worker:
             else:
                 pattern_detected = self._has_retryable_failure_pattern(log_file=log_file)
             if pattern_detected:
-                logger.warning("Task %s matched retryable failure pattern despite exit code 0", task_id)
+                logger.warning(
+                    "Task %s matched retryable failure pattern despite exit code 0; "
+                    "counting it as a task failure",
+                    task_id,
+                )
                 self._record_timeline("task_retryable_pattern_detected", task_id=task_id)
-                return "failed", "infra"
+                return "failed", "task"
 
         disconnect_detected = False
         if self.debug:
@@ -822,17 +1304,61 @@ class Worker:
         if disconnect_detected:
             logger.warning("Task %s matched worker disconnect pattern; treating as infra failure", task_id)
             self._record_timeline("task_worker_disconnect_detected", task_id=task_id)
+            self._record_task_exit_code(task_id, exit_code)
             return "failed", "preempted" if self._is_preempted() else "infra"
+
+        # Check for known infra failure patterns in task output
+        if exit_code != 0:
+            infra_pattern_detected = False
+            if self.debug:
+                infra_pattern_detected = self._has_infra_failure_pattern(text="".join(output_buffer))
+            else:
+                infra_pattern_detected = self._has_infra_failure_pattern(log_file=log_file)
+            if infra_pattern_detected:
+                logger.warning("Task %s matched infra failure pattern; treating as infra failure", task_id)
+                self._record_timeline("task_infra_pattern_detected", task_id=task_id, exit_code=exit_code)
+                self._record_task_exit_code(task_id, exit_code)
+                return "failed", "infra"
 
         if exit_code == 255:
             # SSH exit 255 = connection lost, always an infrastructure issue
+            self._record_task_exit_code(task_id, exit_code)
             if self._is_preempted():
                 logger.warning("Task %s: SSH exit 255 + TPU preempted → infra failure", task_id)
                 return "failed", "preempted"
             else:
                 logger.warning("Task %s: SSH exit 255 (connection lost) → infra failure", task_id)
                 return "failed", "infra"
-        elif exit_code != 0:
+
+        # Exit 137 (SIGKILL/OOM) on multi-host tasks is almost always infra
+        if exit_code == 137 and num_workers > 1:
+            logger.warning(
+                "Task %s: exit 137 (SIGKILL/OOM) on multi-host (%d workers) → infra failure",
+                task_id, num_workers,
+            )
+            self._record_timeline("task_infra_exit137", task_id=task_id, num_workers=num_workers)
+            self._record_task_exit_code(task_id, exit_code)
+            return "failed", "infra"
+
+        # Repeated same-exit-code across runs indicates a systemic issue
+        if exit_code != 0:
+            prev_codes = self._get_task_exit_codes(task_id)
+            if exit_code in prev_codes:
+                logger.warning(
+                    "Task %s: repeated exit code %d (seen %d time(s) before) → systemic infra failure",
+                    task_id, exit_code, prev_codes.count(exit_code),
+                )
+                self._record_timeline(
+                    "task_repeated_exit_code",
+                    task_id=task_id,
+                    exit_code=exit_code,
+                    prev_count=prev_codes.count(exit_code),
+                )
+                self._record_task_exit_code(task_id, exit_code)
+                return "failed", "infra"
+
+        if exit_code != 0:
+            self._record_task_exit_code(task_id, exit_code)
             self._record_timeline("task_failed",
                                   phase="task",
                                   task_id=task_id,
@@ -875,6 +1401,7 @@ class Worker:
         proc: subprocess.Popen,
         task_id: str,
         activity_tracker: _OutputActivityTracker | None = None,
+        health_monitor: _MidTaskHealthMonitor | None = None,
     ) -> tuple[int, str | None]:
         while True:
             exit_code = proc.poll()
@@ -884,6 +1411,19 @@ class Worker:
             if control_state is not None:
                 exit_code = self._terminate_task_process(proc, task_id, control_state)
                 return exit_code, control_state
+            if health_monitor is not None and health_monitor.is_degraded:
+                reason = health_monitor.degradation_reason
+                logger.warning(
+                    "Task %s: mid-task health degradation detected (%s); terminating",
+                    task_id, reason,
+                )
+                self._record_timeline(
+                    "task_midtask_health_kill",
+                    task_id=task_id,
+                    reason=reason,
+                )
+                exit_code = self._terminate_task_process(proc, task_id, "health_degradation")
+                return exit_code, "health_degraded"
             if (
                 activity_tracker is not None
                 and self._task_inactivity_timeout_secs is not None
@@ -902,6 +1442,77 @@ class Worker:
                 exit_code = self._terminate_task_process(proc, task_id, "inactivity_timeout")
                 return exit_code, "failed"
             time.sleep(self._TASK_CONTROL_POLL_INTERVAL)
+
+    def _collect_remote_error_logs(
+        self,
+        log_file: str,
+        log_dir: str,
+        run_count: int,
+        num_workers: int,
+        task_id: str,
+    ) -> None:
+        """Fetch per-worker error logs from the coordinator (worker 0) and save them locally.
+
+        multihost_runner_orig.py writes all worker output files to a local /tmp/<timestamp>/
+        directory on the coordinator machine (worker 0). This method SSHes to worker 0,
+        fetches the relevant file(s), and saves them as run_{run_count}_worker_{pool}_{i}.err.
+
+        If the failure message identifies a specific worker, only that worker's log is fetched.
+        Otherwise (e.g. OOM kill), all worker logs are fetched individually.
+        """
+        try:
+            with open(log_file) as f:
+                content = f.read()
+        except OSError:
+            return
+
+        match = _REMOTE_LOG_DIR_RE.search(content) or _REMOTE_LOG_DIR_RUNNING_RE.search(content)
+        if not match:
+            return
+
+        remote_log_dir = match.group(1).rstrip("/")
+
+        # Derive naming prefix from jobman worker ID: "128_5" -> "128"
+        worker_suffix = self.worker_id.split("-")[-1]
+        err_prefix = worker_suffix.rsplit("_", 1)[0] if "_" in worker_suffix else worker_suffix
+
+        # Identify which multihost worker(s) failed
+        failed_match = _REMOTE_FAILED_WORKER_RE.search(content)
+        if failed_match:
+            workers_to_fetch = [(int(failed_match.group(1)), int(failed_match.group(2)))]
+            logger.info(
+                "Task %s: collecting remote error log for failed slice %s worker %s from %s",
+                task_id, failed_match.group(1), failed_match.group(2), remote_log_dir,
+            )
+        else:
+            # Process was killed before failure message — fetch all workers
+            workers_to_fetch = [(0, i) for i in range(num_workers)]
+            logger.info(
+                "Task %s: no failure message found (killed?), collecting all %d worker logs from %s",
+                task_id, num_workers, remote_log_dir,
+            )
+
+        for slice_num, worker_num in workers_to_fetch:
+            remote_file = f"{remote_log_dir}/output_slice_{slice_num:04d}_worker_{worker_num:04d}.txt"
+            local_err_file = os.path.join(log_dir, f"run_{run_count}_worker_{err_prefix}_{worker_num}.err")
+            inline = f"cat {shlex.quote(remote_file)} 2>/dev/null"
+            result = subprocess.run(
+                self._ssh_cmd(0, inline),  # logs live on coordinator (worker 0)
+                capture_output=True,
+                text=True,
+            )
+            try:
+                with open(local_err_file, "w") as ef:
+                    if result.stdout:
+                        ef.write(result.stdout)
+                    if result.returncode != 0:
+                        ef.write(f"\n[Remote log collection exited {result.returncode}]\n")
+                        if result.stderr:
+                            ef.write(result.stderr)
+            except OSError as e:
+                logger.warning("Task %s: could not write error log for worker %d: %s", task_id, worker_num, e)
+            else:
+                logger.info("Task %s: saved remote error log for worker %d → %s", task_id, worker_num, local_err_file)
 
     def _has_retryable_failure_pattern(self, text: str = "", log_file: str = "") -> bool:
         if text:
@@ -926,11 +1537,52 @@ class Worker:
                 logger.warning("Failed to read task log %s for worker disconnect detection", log_file)
         return False
 
+    def _has_infra_failure_pattern(self, text: str = "", log_file: str = "") -> bool:
+        if text:
+            return any(pattern in text for pattern in _INFRA_FAILURE_PATTERNS)
+        if log_file and os.path.exists(log_file):
+            try:
+                with open(log_file) as f:
+                    content = f.read()
+                return any(pattern in content for pattern in _INFRA_FAILURE_PATTERNS)
+            except OSError:
+                logger.warning("Failed to read task log %s for infra failure detection", log_file)
+        return False
+
+    def _record_task_exit_code(self, task_id: str, exit_code: int) -> None:
+        """Append an exit code to the task's exit code history file."""
+        ec_path = os.path.join(self._task_log_root, task_id, "exit_codes.json")
+        os.makedirs(os.path.dirname(ec_path), exist_ok=True)
+        codes: list[int] = []
+        if os.path.exists(ec_path):
+            try:
+                with open(ec_path) as f:
+                    codes = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        codes.append(exit_code)
+        try:
+            with open(ec_path, "w") as f:
+                json.dump(codes, f)
+        except OSError:
+            logger.warning("Failed to record exit code for task %s", task_id)
+
+    def _get_task_exit_codes(self, task_id: str) -> list[int]:
+        """Get the task's exit code history from previous runs."""
+        ec_path = os.path.join(self._task_log_root, task_id, "exit_codes.json")
+        if os.path.exists(ec_path):
+            try:
+                with open(ec_path) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return []
+
     def _is_preempted(self) -> bool:
         status = self.tpu.status()
-        if status in ("PREEMPTED", "TERMINATED", "NOT_FOUND", "SUSPENDED", "FAILED"):
+        if status in ("PREEMPTED", "TERMINATED", "NOT_FOUND", "SUSPENDED", "FAILED", "UNHEALTHY"):
             self._record_timeline("tpu_unavailable", status=status)
-        return status in ("PREEMPTED", "TERMINATED", "NOT_FOUND", "SUSPENDED", "FAILED")
+        return status in ("PREEMPTED", "TERMINATED", "NOT_FOUND", "SUSPENDED", "FAILED", "UNHEALTHY")
 
     def _record_timeline(self, event: str, **fields) -> None:
         entry = {"time": _now(), "event": event, "worker_id": self.worker_id}

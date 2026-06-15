@@ -11,8 +11,19 @@ from .utils import get_logger
 
 logger = get_logger(__name__)
 
-TPUStatus = Literal["READY", "CREATING", "PREEMPTED", "TERMINATED", "SUSPENDED",
-                    "FAILED", "NOT_FOUND", "UNKNOWN"]
+TPUStatus = Literal[
+    "READY",
+    "WAITING_FOR_RESOURCES",
+    "PROVISIONING",
+    "CREATING",
+    "UNHEALTHY",
+    "PREEMPTED",
+    "TERMINATED",
+    "SUSPENDED",
+    "FAILED",
+    "NOT_FOUND",
+    "UNKNOWN",
+]
 AllocationMode = Literal["tpu-vm", "queued-resources"]
 Pricing = Literal["spot", "preemptible", "standard"]
 
@@ -21,7 +32,8 @@ DEFAULT_TPU_VERSION = "tpu-ubuntu2204-base"
 
 _TPU_VERSION_MAP = {
     "v4": "tpu-ubuntu2204-base",
-    "v5litepod": "v2-alpha-tpuv5-lite",
+    "v5e": "v2-alpha-tpuv5-lite",
+    "v5p": "v2-alpha-tpuv5",
     "v6e": "v2-alpha-tpuv6e",
 }
 
@@ -53,7 +65,9 @@ def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         detail = _command_output(result) or "no stdout/stderr"
-        logger.warning("gcloud command failed (%d): %s\n%s", result.returncode, cmd_str, detail)
+        # Suppress warning for NOT_FOUND errors (expected for non-existent resources)
+        if "NOT_FOUND" not in detail:
+            logger.warning("gcloud command failed (%d): %s\n%s", result.returncode, cmd_str, detail)
         if check:
             raise RuntimeError(
                 f"Command failed ({result.returncode}): {cmd_str}\n{detail}"
@@ -98,6 +112,63 @@ class TPU:
         """Return the TPU VM status directly."""
         return self._tpu_vm_status()
 
+    def describe(self) -> dict | None:
+        """Return the raw TPU describe payload for the active resource, if available."""
+        if self.mode == "queued-resources":
+            return self._describe_queued_resource()
+        return self._describe_tpu_vm()
+
+    def health_status(self) -> str:
+        """Return HEALTHY, UNHEALTHY, or UNKNOWN for the active TPU resource."""
+        if self.mode == "queued-resources":
+            qr_info = self._describe_queued_resource()
+            if not isinstance(qr_info, dict):
+                return "UNKNOWN"
+            state = qr_info.get("state", {})
+            if isinstance(state, dict):
+                state = state.get("state", "UNKNOWN")
+            if str(state).upper() != "ACTIVE":
+                return "UNKNOWN"
+            info = self._describe_tpu_vm()
+        else:
+            info = self._describe_tpu_vm()
+        if not isinstance(info, dict):
+            return "UNKNOWN"
+        return _normalize_health_status(info)
+
+    def health_description(self) -> str:
+        """Return a human-readable health summary, if present."""
+        if self.mode == "queued-resources":
+            qr_info = self._describe_queued_resource()
+            if not isinstance(qr_info, dict):
+                return ""
+            state = qr_info.get("state", {})
+            if isinstance(state, dict):
+                state = state.get("state", "UNKNOWN")
+            if str(state).upper() != "ACTIVE":
+                return ""
+            info = self._describe_tpu_vm()
+        else:
+            info = self._describe_tpu_vm()
+        if not isinstance(info, dict):
+            return ""
+        description = info.get("healthDescription")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
+        symptoms = info.get("symptoms")
+        if isinstance(symptoms, list):
+            details: list[str] = []
+            for symptom in symptoms:
+                if not isinstance(symptom, dict):
+                    continue
+                symptom_type = str(symptom.get("symptomType", "")).strip()
+                symptom_details = str(symptom.get("details", "")).strip()
+                text = ", ".join(part for part in (symptom_type, symptom_details) if part)
+                if text:
+                    details.append(text)
+            return "; ".join(details)
+        return ""
+
     def queued_resource_status(self) -> str:
         """Return the queued resource state directly (e.g. ACTIVE, FAILED, NOT_FOUND)."""
         if self.mode != "queued-resources":
@@ -122,15 +193,22 @@ class TPU:
 
     def delete(self) -> None:
         """Delete the TPU VM (and queued resource if applicable)."""
-        if self.mode == "queued-resources":
-            self._delete_queued_resource()
         self._delete_tpu_vm()
+        if self.mode == "queued-resources":
+            self._wait_tpu_vm_deleted()
+            self._delete_queued_resource()
 
-    def wait_ready(self, timeout: int = 86400, poll_interval: int = 30) -> None:
+    def wait_ready(
+        self,
+        timeout: int = 86400,
+        poll_interval: int = 30,
+        status_callback=None,
+    ) -> None:
         """Poll until READY or timeout. Uses exponential backoff up to poll_interval."""
         logger.info("Waiting for TPU %s to be READY (timeout=%ds)...", self.name, timeout)
         start = time.time()
         interval = 10
+        last_reported: TPUStatus | None = None
         while True:
             elapsed = time.time() - start
             if elapsed > timeout:
@@ -139,8 +217,16 @@ class TPU:
             if st == "READY":
                 logger.info("TPU %s is READY (%.0fs elapsed)", self.name, elapsed)
                 return
+            if st == "UNHEALTHY":
+                raise RuntimeError(
+                    f"TPU {self.name} entered unhealthy state: "
+                    f"{self.health_description() or 'unhealthy'}"
+                )
             if st in ("PREEMPTED", "TERMINATED", "FAILED", "SUSPENDED"):
                 raise RuntimeError(f"TPU {self.name} entered terminal state: {st}")
+            if status_callback is not None and st != last_reported:
+                status_callback(st)
+                last_reported = st
             logger.info("TPU %s status=%s, waiting %ds...", self.name, st, interval)
             time.sleep(interval)
             interval = min(interval * 2, poll_interval)
@@ -169,20 +255,16 @@ class TPU:
         _run(cmd, check=True)
 
     def _tpu_vm_status(self) -> TPUStatus:
-        result = _run([
-            "gcloud", "compute", "tpus", "tpu-vm", "describe", self.name,
-            f"--zone={self.zone}", "--format=json"
-        ], check=False)
-        if result.returncode != 0:
-            if "NOT_FOUND" in result.stderr or "not found" in result.stderr.lower():
-                return "NOT_FOUND"
+        info = self._describe_tpu_vm()
+        if info == "NOT_FOUND":
+            return "NOT_FOUND"
+        if not isinstance(info, dict):
             return "UNKNOWN"
-        try:
-            info = json.loads(result.stdout)
-            state = info.get("state", "UNKNOWN").upper()
-            return _normalize_status(state)
-        except (json.JSONDecodeError, KeyError):
-            return "UNKNOWN"
+        state = str(info.get("state", "UNKNOWN")).upper()
+        normalized = _normalize_status(state)
+        if _normalize_health_status(info) == "UNHEALTHY":
+            return "UNHEALTHY"
+        return normalized
 
     def _delete_tpu_vm(self) -> None:
         logger.info("Deleting TPU VM %s...", self.name)
@@ -213,17 +295,12 @@ class TPU:
         _run(cmd, check=True)
 
     def _queued_resource_status(self) -> TPUStatus:
-        result = _run([
-            "gcloud", "compute", "tpus", "queued-resources", "describe",
-            self._queued_resource_id,
-            f"--zone={self.zone}", "--format=json"
-        ], check=False)
-        if result.returncode != 0:
-            if "NOT_FOUND" in result.stderr or "not found" in result.stderr.lower():
-                return "NOT_FOUND"
+        info = self._describe_queued_resource()
+        if info == "NOT_FOUND":
+            return "NOT_FOUND"
+        if not isinstance(info, dict):
             return "UNKNOWN"
         try:
-            info = json.loads(result.stdout)
             state = info.get("state", {})
             if isinstance(state, dict):
                 state = state.get("state", "UNKNOWN")
@@ -237,6 +314,16 @@ class TPU:
             return self._tpu_vm_status()
 
         return _normalize_status(qr_state)
+
+    def _wait_tpu_vm_deleted(self, timeout: int = 300, poll_interval: int = 10) -> None:
+        """Poll until the TPU VM is gone (NOT_FOUND), so the QR can be deleted."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._tpu_vm_status() == "NOT_FOUND":
+                return
+            logger.info("Waiting for TPU VM %s to finish deleting...", self.name)
+            time.sleep(poll_interval)
+        logger.warning("TPU VM %s still exists after %ds; proceeding with QR deletion anyway.", self.name, timeout)
 
     def _delete_queued_resource(self, max_retries: int = 3) -> None:
         logger.info("Deleting queued resource %s...", self._queued_resource_id)
@@ -258,6 +345,37 @@ class TPU:
             if attempt < max_retries:
                 time.sleep(5 * attempt)
 
+    def _describe_tpu_vm(self) -> dict | None:
+        result = _run([
+            "gcloud", "compute", "tpus", "tpu-vm", "describe", self.name,
+            f"--zone={self.zone}", "--format=json"
+        ], check=False)
+        if result.returncode != 0:
+            if "NOT_FOUND" in result.stderr or "not found" in result.stderr.lower():
+                return "NOT_FOUND"
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _describe_queued_resource(self) -> dict | None:
+        result = _run([
+            "gcloud", "compute", "tpus", "queued-resources", "describe",
+            self._queued_resource_id,
+            f"--zone={self.zone}", "--format=json"
+        ], check=False)
+        if result.returncode != 0:
+            if "NOT_FOUND" in result.stderr or "not found" in result.stderr.lower():
+                return "NOT_FOUND"
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
 
 # ------------------------------------------------------------------
 # Utilities
@@ -266,9 +384,10 @@ class TPU:
 def _normalize_status(state: str) -> TPUStatus:
     mapping = {
         "READY": "READY",
-        "PROVISIONING": "CREATING",
+        "PROVISIONING": "PROVISIONING",
         "CREATING": "CREATING",
-        "WAITING_FOR_RESOURCES": "CREATING",
+        "UNHEALTHY": "UNHEALTHY",
+        "WAITING_FOR_RESOURCES": "WAITING_FOR_RESOURCES",
         "PREEMPTED": "PREEMPTED",
         "TERMINATED": "TERMINATED",
         "SUSPENDING": "SUSPENDED",
@@ -279,13 +398,42 @@ def _normalize_status(state: str) -> TPUStatus:
     return mapping.get(state, "UNKNOWN")  # type: ignore[return-value]
 
 
+def _normalize_health_status(info: dict) -> str:
+    health = str(info.get("health", "") or "").upper()
+    description = str(info.get("healthDescription", "") or "").lower()
+    symptoms = info.get("symptoms", [])
+
+    if health.startswith("UNHEALTHY"):
+        return "UNHEALTHY"
+    if health == "HEALTHY":
+        return "HEALTHY"
+
+    if "maintenance event" in description or "out of memory" in description or "oom" in description:
+        return "UNHEALTHY"
+
+    if isinstance(symptoms, list):
+        for symptom in symptoms:
+            if not isinstance(symptom, dict):
+                continue
+            symptom_type = str(symptom.get("symptomType", "") or "").upper()
+            symptom_details = str(symptom.get("details", "") or "").lower()
+            if symptom_type.startswith("OUT_OF_MEMORY"):
+                return "UNHEALTHY"
+            if "maintenance event" in symptom_details or "out of memory" in symptom_details or "oom" in symptom_details:
+                return "UNHEALTHY"
+
+    if health:
+        return "UNHEALTHY"
+    return "UNKNOWN"
+
+
 def _num_workers(accelerator: str) -> int:
     """Infer worker count from accelerator string like v4-8, v5e-16, v6e-32."""
     try:
         parts = accelerator.lower().split("-")
         chips = int(parts[-1])
         gen = parts[0]  # e.g. "v4", "v5e", "v6e"
-        if gen == "v4":
+        if gen in ("v4", "v5p"):
             return max(1, chips // 8)
         elif gen in ("v5e", "v6e"):
             return max(1, chips // 4)

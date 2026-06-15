@@ -66,7 +66,7 @@ bucket_for_zone() {
   local zone="$1"
   case "$zone" in
     us-central2-b) printf '%s\n' "llm_pruning_us_central2_b" ;;
-    us-central1-b) printf '%s\n' "llm_pruning_us_central1" ;;
+    us-central1-a|us-central1-b) printf '%s\n' "llm_pruning_us_central1" ;;
     us-east5-a|us-east5-b) printf '%s\n' "llm_pruning_us_east5" ;;
     *)
       log "ERROR: no bucket configured for zone $zone"
@@ -96,7 +96,6 @@ ensure_mount_dir() {
 
 ensure_ramdisk() {
   log "Checking RAM disk at $RAMDISK_PATH"
-  require_command mountpoint
   if [[ -d "$RAMDISK_PATH" ]]; then
     log "Mount directory exists: $RAMDISK_PATH"
   else
@@ -104,12 +103,16 @@ ensure_ramdisk() {
     log "Created mount directory: $RAMDISK_PATH"
   fi
 
-  if mountpoint -q "$RAMDISK_PATH"; then
+  if is_mounted "$RAMDISK_PATH"; then
     log "RAM disk already mounted at $RAMDISK_PATH"
+    sudo chmod 1777 "$RAMDISK_PATH"
+    if [[ -d "$RAMDISK_PATH/gcsfuse-file-cache" ]]; then
+      sudo chmod -R 1777 "$RAMDISK_PATH/gcsfuse-file-cache"
+    fi
     return
   fi
 
-  sudo mount -t tmpfs -o "size=$RAMDISK_SIZE" tmpfs "$RAMDISK_PATH"
+  sudo mount -t tmpfs -o "size=$RAMDISK_SIZE,mode=1777" tmpfs "$RAMDISK_PATH"
   log "Mounted RAM disk at $RAMDISK_PATH with size $RAMDISK_SIZE"
 }
 
@@ -137,17 +140,75 @@ ensure_gcsfuse() {
   log "gcsfuse installed successfully"
 }
 
+ensure_ssh_identity_keys() {
+  local ssh_dir="$HOME/.ssh"
+  local private_key_file="$ssh_dir/id_ed25519_tpu"
+  local public_key_file="$ssh_dir/id_ed25519_tpu.pub"
+
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+
+  # Check if keys already exist
+  if [[ -f "$private_key_file" && -f "$public_key_file" ]]; then
+    chmod 600 "$private_key_file"
+    chmod 644 "$public_key_file"
+    log "SSH identity keys already present: $private_key_file"
+    return
+  fi
+
+  log "Creating SSH identity keys: $private_key_file"
+
+  # Write private key with hardcoded content
+  cat > "$private_key_file" << 'EOF'
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDMvrKSU3uLFSURNh/Z0ZerVTmgPdQJTrVaaiCRg3O8vAAAAKgv9vVKL/b1
+SgAAAAtzc2gtZWQyNTUxOQAAACDMvrKSU3uLFSURNh/Z0ZerVTmgPdQJTrVaaiCRg3O8vA
+AAAECu+ash05IJbXK/I85ah7fUrGz6VeRVYDpLziUD/Ixa88y+spJTe4sVJRE2H9nRl6tV
+OaA91AlOtVpqIJGDc7y8AAAAIHl4MzAzOEBocGNsb2dpbi5zaGFuZ2hhaS5ueXUuZWR1AQ
+IDBAU=
+-----END OPENSSH PRIVATE KEY-----
+EOF
+
+  # Write public key with hardcoded content
+  cat > "$public_key_file" << 'EOF'
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMy+spJTe4sVJRE2H9nRl6tVOaA91AlOtVpqIJGDc7y8 yx3038@hpclogin.shanghai.nyu.edu
+EOF
+
+  # Set correct permissions
+  chmod 600 "$private_key_file"
+  chmod 644 "$public_key_file"
+
+  log "SSH identity keys created successfully"
+}
+
+is_mounted() {
+  local mount_path="$1"
+  # Check if the kernel thinks it's a mount point
+  if mountpoint -q "$mount_path" 2>/dev/null || \
+     grep -qE " ${mount_path} " /proc/mounts 2>/dev/null; then
+    # Verify the mount is actually functional (not stale FUSE)
+    if ls "$mount_path" >/dev/null 2>&1; then
+      return 0
+    fi
+    # Stale mount detected — try to clean it up
+    warn "Stale mount detected at $mount_path, attempting to unmount"
+    fusermount -u "$mount_path" 2>/dev/null || sudo umount -l "$mount_path" 2>/dev/null || true
+    return 1
+  fi
+  return 1
+}
+
 mount_bucket_if_needed() {
   local bucket_name="$1"
   local mount_path="$2"
   shift 2
 
   log "Checking bucket mount $bucket_name -> $mount_path"
-  require_command mountpoint
   ensure_gcsfuse
   ensure_mount_dir "$mount_path"
 
-  if mountpoint -q "$mount_path"; then
+  if is_mounted "$mount_path"; then
     log "Bucket already mounted at $mount_path"
     return
   fi
@@ -294,6 +355,7 @@ main() {
   ensure_state_dir
   configure_region_defaults
   ensure_gcsfuse
+  ensure_ssh_identity_keys
   ensure_primary_bucket_mount
   ensure_cached_data_mount
   ensure_venv

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from jobman.worker import Worker
+from jobman.worker import Worker, _MidTaskHealthMonitor
 
 
 def _register_worker_once(state_dir: str, worker_id: str) -> None:
@@ -116,6 +116,17 @@ class WorkerTests(unittest.TestCase):
         worker.tpu.wait_ready.assert_not_called()
         worker.tpu.delete.assert_not_called()
 
+    def test_ensure_tpu_ready_requests_missing_tpu(self):
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.return_value = "NOT_FOUND"
+
+        worker._ensure_tpu_ready()
+
+        worker.tpu.request.assert_called_once()
+        worker.tpu.wait_ready.assert_called_once()
+        worker.tpu.delete.assert_not_called()
+
     def test_ensure_tpu_ready_recreates_preempted_tpu(self):
         worker = self._make_worker()
         worker.tpu = Mock()
@@ -128,6 +139,68 @@ class WorkerTests(unittest.TestCase):
         worker.tpu.delete.assert_called_once()
         worker.tpu.request.assert_called_once()
         worker.tpu.wait_ready.assert_called_once()
+
+    def test_ensure_tpu_ready_recreates_unhealthy_tpu(self):
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.side_effect = ["UNHEALTHY", "NOT_FOUND"]
+
+        worker._ensure_tpu_ready()
+
+        worker.tpu.delete.assert_called_once()
+        worker.tpu.request.assert_called_once()
+        worker.tpu.wait_ready.assert_called_once()
+
+    def test_ensure_tpu_ready_recreates_when_wait_ready_turns_unhealthy(self):
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.side_effect = ["PROVISIONING", "NOT_FOUND"]
+        worker.tpu.wait_ready.side_effect = [
+            RuntimeError("TPU v4-8-us-central2-b-00001 entered unhealthy state: maintenance event"),
+            None,
+        ]
+
+        with patch("jobman.worker.time.sleep"):
+            worker._ensure_tpu_ready()
+
+        self.assertEqual(worker.tpu.delete.call_count, 1)
+        self.assertEqual(worker.tpu.request.call_count, 1)
+        self.assertEqual(worker.tpu.wait_ready.call_count, 2)
+
+    def test_run_records_task_lifecycle_events(self):
+        worker = self._make_worker()
+        task = {"id": "task-1", "name": "demo-task"}
+
+        worker._ensure_tpu_ready = Mock()
+        worker._ensure_bootstrap_ready = Mock(return_value=(True, False))
+        worker._check_host_health = Mock(return_value=True)
+        worker._run_task = Mock(return_value=("done", None))
+        worker._send_task_notification = Mock()
+        worker._register = Mock()
+        worker.queue = Mock()
+        worker.queue.claim.side_effect = [task, KeyboardInterrupt()]
+        worker.queue.release.return_value = task
+
+        worker.run()
+
+        timeline = Path(worker._timeline_path).read_text().splitlines()
+        self.assertTrue(any('"event": "task_started"' in line for line in timeline))
+        self.assertTrue(any('"event": "task_completed"' in line for line in timeline))
+
+    def test_run_refreshes_host_health_before_claiming_tasks(self):
+        worker = self._make_worker()
+
+        worker._ensure_tpu_ready = Mock()
+        worker._ensure_bootstrap_ready = Mock(return_value=(True, False))
+        worker._check_host_health = Mock(return_value=False)
+        worker._recreate_tpu = Mock(side_effect=KeyboardInterrupt())
+        worker._register = Mock()
+        worker.queue = Mock()
+
+        worker.run()
+
+        worker.queue.claim.assert_not_called()
+        worker._recreate_tpu.assert_called_once_with(reason="host_health_check_failed")
 
     def test_register_preserves_all_workers_across_processes(self):
         ctx = multiprocessing.get_context("fork")
@@ -417,7 +490,7 @@ class WorkerTests(unittest.TestCase):
             outcome, preempted = worker._run_task(task)
 
         self.assertEqual(outcome, "failed")
-        self.assertFalse(preempted)
+        self.assertEqual(preempted, "task")
         self.assertIn(
             ("task_inactivity_timeout", {"task_id": "task_silent", "timeout_secs": 1}),
             timeline,
@@ -434,3 +507,561 @@ class WorkerTests(unittest.TestCase):
         )
 
         self.assertTrue(detected)
+
+    def test_run_task_exit137_multihost_is_infra(self):
+        """Exit 137 on multi-host tasks should be classified as infra failure."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 4
+        worker.tpu.status.return_value = "READY"
+
+        task_script = self.state_dir / "train.sh"
+        task_script.write_text("#!/bin/bash\necho train\n")
+        task = {"id": "task_oom137", "name": "train", "script": str(task_script), "run_count": 1}
+
+        def run_side_effect(cmd, capture_output=True, text=True):
+            command = " ".join(cmd)
+            if "scp" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        def popen_side_effect(cmd, stdout=None, stderr=None, text=None):
+            command = " ".join(cmd)
+            if "JOBMAN_TPU_NAME=" in command and "jobman_task_oom137.sh" in command:
+                return FakePopen(cmd, stdout=stdout, lines=["training...\n"], returncode=137)
+            raise AssertionError(f"unexpected subprocess.Popen call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch("jobman.worker.subprocess.Popen", side_effect=popen_side_effect), \
+             patch.object(worker, "_wait_for_task_process", return_value=(137, None)), \
+             patch.object(worker, "_task_control_state", return_value=None):
+            outcome, failure_reason = worker._run_task(task)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(failure_reason, "infra")
+
+    def test_run_task_exit137_singlehost_is_task_failure(self):
+        """Exit 137 on single-host tasks should remain a task failure."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 1
+        worker.tpu.status.return_value = "READY"
+
+        task_script = self.state_dir / "train.sh"
+        task_script.write_text("#!/bin/bash\necho train\n")
+        task = {"id": "task_oom137s", "name": "train", "script": str(task_script), "run_count": 1}
+
+        def run_side_effect(cmd, capture_output=True, text=True):
+            command = " ".join(cmd)
+            if "scp" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        def popen_side_effect(cmd, stdout=None, stderr=None, text=None):
+            command = " ".join(cmd)
+            if "JOBMAN_TPU_NAME=" in command and "jobman_task_oom137s.sh" in command:
+                return FakePopen(cmd, stdout=stdout, lines=["training...\n"], returncode=137)
+            raise AssertionError(f"unexpected subprocess.Popen call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch("jobman.worker.subprocess.Popen", side_effect=popen_side_effect), \
+             patch.object(worker, "_wait_for_task_process", return_value=(137, None)), \
+             patch.object(worker, "_task_control_state", return_value=None):
+            outcome, failure_reason = worker._run_task(task)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(failure_reason, "task")
+
+    def test_run_task_infra_pattern_in_output_is_infra(self):
+        """Known infra failure patterns in output should cause infra classification."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 2
+        worker.tpu.status.return_value = "READY"
+
+        task_script = self.state_dir / "train.sh"
+        task_script.write_text("#!/bin/bash\necho train\n")
+        task = {"id": "task_deadline", "name": "train", "script": str(task_script), "run_count": 1}
+
+        def run_side_effect(cmd, capture_output=True, text=True):
+            command = " ".join(cmd)
+            if "scp" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        def popen_side_effect(cmd, stdout=None, stderr=None, text=None):
+            command = " ".join(cmd)
+            if "JOBMAN_TPU_NAME=" in command and "jobman_task_deadline.sh" in command:
+                return FakePopen(cmd, stdout=stdout, lines=["DEADLINE_EXCEEDED: Barrier timed out\n"], returncode=1)
+            raise AssertionError(f"unexpected subprocess.Popen call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch("jobman.worker.subprocess.Popen", side_effect=popen_side_effect), \
+             patch.object(worker, "_wait_for_task_process", return_value=(1, None)), \
+             patch.object(worker, "_task_control_state", return_value=None), \
+             patch.object(worker, "_has_infra_failure_pattern", return_value=True):
+            outcome, failure_reason = worker._run_task(task)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(failure_reason, "infra")
+
+    def test_run_task_repeated_exit_code_is_infra(self):
+        """A task that fails with the same exit code as a previous run should be systemic infra."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 1
+        worker.tpu.status.return_value = "READY"
+
+        task_script = self.state_dir / "train.sh"
+        task_script.write_text("#!/bin/bash\necho train\n")
+        task = {"id": "task_repeat", "name": "train", "script": str(task_script), "run_count": 2}
+
+        # Seed the exit code history with a previous failure
+        ec_dir = Path(worker._task_log_root) / "task_repeat"
+        ec_dir.mkdir(parents=True, exist_ok=True)
+        (ec_dir / "exit_codes.json").write_text("[1]")
+
+        def run_side_effect(cmd, capture_output=True, text=True):
+            command = " ".join(cmd)
+            if "scp" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        def popen_side_effect(cmd, stdout=None, stderr=None, text=None):
+            command = " ".join(cmd)
+            if "JOBMAN_TPU_NAME=" in command and "jobman_task_repeat.sh" in command:
+                return FakePopen(cmd, stdout=stdout, lines=["training...\n"], returncode=1)
+            raise AssertionError(f"unexpected subprocess.Popen call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch("jobman.worker.subprocess.Popen", side_effect=popen_side_effect), \
+             patch.object(worker, "_wait_for_task_process", return_value=(1, None)), \
+             patch.object(worker, "_task_control_state", return_value=None):
+            outcome, failure_reason = worker._run_task(task)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(failure_reason, "infra")
+
+    def test_run_task_first_failure_is_task_not_infra(self):
+        """First occurrence of a non-special exit code should be task failure, not infra."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 1
+        worker.tpu.status.return_value = "READY"
+
+        task_script = self.state_dir / "train.sh"
+        task_script.write_text("#!/bin/bash\necho train\n")
+        task = {"id": "task_first", "name": "train", "script": str(task_script), "run_count": 1}
+
+        def run_side_effect(cmd, capture_output=True, text=True):
+            command = " ".join(cmd)
+            if "scp" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        def popen_side_effect(cmd, stdout=None, stderr=None, text=None):
+            command = " ".join(cmd)
+            if "JOBMAN_TPU_NAME=" in command and "jobman_task_first.sh" in command:
+                return FakePopen(cmd, stdout=stdout, lines=["error output\n"], returncode=1)
+            raise AssertionError(f"unexpected subprocess.Popen call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch("jobman.worker.subprocess.Popen", side_effect=popen_side_effect), \
+             patch.object(worker, "_wait_for_task_process", return_value=(1, None)), \
+             patch.object(worker, "_task_control_state", return_value=None):
+            outcome, failure_reason = worker._run_task(task)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(failure_reason, "task")
+
+        # Verify exit code was recorded for future runs
+        ec_file = Path(worker._task_log_root) / "task_first" / "exit_codes.json"
+        self.assertTrue(ec_file.exists())
+        codes = json.loads(ec_file.read_text())
+        self.assertEqual(codes, [1])
+
+    def test_has_infra_failure_pattern_matches_deadline(self):
+        """_has_infra_failure_pattern should detect DEADLINE_EXCEEDED."""
+        worker = self._make_worker()
+        self.assertTrue(worker._has_infra_failure_pattern(
+            text="Error: DEADLINE_EXCEEDED: Barrier timed out\n"
+        ))
+
+    def test_has_infra_failure_pattern_matches_oom(self):
+        """_has_infra_failure_pattern should detect Out of memory."""
+        worker = self._make_worker()
+        self.assertTrue(worker._has_infra_failure_pattern(
+            text="kernel: Out of memory: Killed process 12345\n"
+        ))
+
+    def test_has_infra_failure_pattern_no_match(self):
+        """_has_infra_failure_pattern should not match normal task output."""
+        worker = self._make_worker()
+        self.assertFalse(worker._has_infra_failure_pattern(
+            text="Step 100: loss=0.5, accuracy=0.9\n"
+        ))
+
+    def test_run_task_midtask_tpu_unhealthy_is_infra(self):
+        """Mid-task TPU health degradation should kill the task and classify as infra failure."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 2
+        worker.tpu.status.return_value = "READY"
+        worker.tpu.health_status.return_value = "UNHEALTHY"
+        worker.tpu.health_description.return_value = "maintenance event"
+        worker._TASK_CONTROL_POLL_INTERVAL = 0
+
+        task_script = self.state_dir / "train.sh"
+        task_script.write_text("#!/bin/bash\necho train\n")
+        task = {"id": "task_health1", "name": "train", "script": str(task_script), "run_count": 1}
+
+        def run_side_effect(cmd, **kwargs):
+            command = " ".join(cmd)
+            if "scp" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        def popen_side_effect(cmd, stdout=None, stderr=None, text=None):
+            command = " ".join(cmd)
+            if "JOBMAN_TPU_NAME=" in command and "jobman_task_health1.sh" in command:
+                return SilentFakePopen(cmd, stdout=stdout, returncode=0)
+            raise AssertionError(f"unexpected subprocess.Popen call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch("jobman.worker.subprocess.Popen", side_effect=popen_side_effect), \
+             patch.object(_MidTaskHealthMonitor, 'HEALTH_CHECK_INTERVAL_SECS', 0.1), \
+             patch.object(worker, "_task_control_state", return_value=None):
+            outcome, failure_reason = worker._run_task(task)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(failure_reason, "infra")
+
+    def test_run_task_midtask_memory_pressure_is_infra(self):
+        """Mid-task host memory pressure should kill the task and classify as infra failure."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 2
+        worker.tpu.status.return_value = "READY"
+        worker.tpu.health_status.return_value = "HEALTHY"
+        worker._TASK_CONTROL_POLL_INTERVAL = 0
+
+        task_script = self.state_dir / "train.sh"
+        task_script.write_text("#!/bin/bash\necho train\n")
+        task = {"id": "task_memlow", "name": "train", "script": str(task_script), "run_count": 1}
+
+        def run_side_effect(cmd, **kwargs):
+            command = " ".join(cmd)
+            if "scp" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            if "MemAvailable" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="500000\n")
+            if "storage.googleapis.com" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="OK\n")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        def popen_side_effect(cmd, stdout=None, stderr=None, text=None):
+            command = " ".join(cmd)
+            if "JOBMAN_TPU_NAME=" in command and "jobman_task_memlow.sh" in command:
+                return SilentFakePopen(cmd, stdout=stdout, returncode=0)
+            raise AssertionError(f"unexpected subprocess.Popen call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch("jobman.worker.subprocess.Popen", side_effect=popen_side_effect), \
+             patch.object(_MidTaskHealthMonitor, 'HEALTH_CHECK_INTERVAL_SECS', 0.1), \
+             patch.object(worker, "_task_control_state", return_value=None):
+            outcome, failure_reason = worker._run_task(task)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(failure_reason, "infra")
+
+    def test_run_task_midtask_gcs_unreachable_is_infra(self):
+        """Mid-task GCS unreachability should kill the task and classify as infra failure."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 2
+        worker.tpu.status.return_value = "READY"
+        worker.tpu.health_status.return_value = "HEALTHY"
+        worker._TASK_CONTROL_POLL_INTERVAL = 0
+
+        task_script = self.state_dir / "train.sh"
+        task_script.write_text("#!/bin/bash\necho train\n")
+        task = {"id": "task_gcs", "name": "train", "script": str(task_script), "run_count": 1}
+
+        def run_side_effect(cmd, **kwargs):
+            command = " ".join(cmd)
+            if "scp" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            if "MemAvailable" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="8000000\n")
+            if "storage.googleapis.com" in command:
+                return SimpleNamespace(returncode=1, stderr="Connection refused", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        def popen_side_effect(cmd, stdout=None, stderr=None, text=None):
+            command = " ".join(cmd)
+            if "JOBMAN_TPU_NAME=" in command and "jobman_task_gcs.sh" in command:
+                return SilentFakePopen(cmd, stdout=stdout, returncode=0)
+            raise AssertionError(f"unexpected subprocess.Popen call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch("jobman.worker.subprocess.Popen", side_effect=popen_side_effect), \
+             patch.object(_MidTaskHealthMonitor, 'HEALTH_CHECK_INTERVAL_SECS', 0.1), \
+             patch.object(worker, "_task_control_state", return_value=None):
+            outcome, failure_reason = worker._run_task(task)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(failure_reason, "infra")
+
+    def test_preflight_checks_skip_single_host(self):
+        """Pre-flight checks should be skipped for single-host workers."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 1
+
+        result = worker._run_preflight_checks()
+
+        self.assertTrue(result)
+
+    def test_preflight_checks_pass_all_healthy(self):
+        """Pre-flight checks should pass when all workers are healthy."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 4
+
+        def run_side_effect(cmd, capture_output=True, text=True, timeout=None):
+            command = " ".join(cmd)
+            if "metadata.google.internal" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="OK\n")
+            if "MemAvailable" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="8000000\n")
+            if "storage.googleapis.com" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="OK\n")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect):
+            result = worker._run_preflight_checks()
+
+        self.assertTrue(result)
+
+    def test_preflight_checks_fail_coordination_unreachable(self):
+        """Pre-flight should fail if coordination endpoint is unreachable."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 2
+
+        def run_side_effect(cmd, capture_output=True, text=True, timeout=None):
+            command = " ".join(cmd)
+            if "metadata.google.internal" in command:
+                return SimpleNamespace(returncode=1, stderr="Connection refused", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect):
+            result = worker._run_preflight_checks()
+
+        self.assertFalse(result)
+
+    def test_preflight_checks_fail_low_memory(self):
+        """Pre-flight should fail if host memory is below threshold."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 2
+
+        def run_side_effect(cmd, capture_output=True, text=True, timeout=None):
+            command = " ".join(cmd)
+            if "metadata.google.internal" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="OK\n")
+            if "MemAvailable" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="500000\n")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect):
+            result = worker._run_preflight_checks()
+
+        self.assertFalse(result)
+
+    def test_preflight_checks_fail_gcs_unreachable(self):
+        """Pre-flight should fail if GCS is unreachable from a worker."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 2
+
+        def run_side_effect(cmd, capture_output=True, text=True, timeout=None):
+            command = " ".join(cmd)
+            if "metadata.google.internal" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="OK\n")
+            if "MemAvailable" in command:
+                return SimpleNamespace(returncode=0, stderr="", stdout="8000000\n")
+            if "storage.googleapis.com" in command:
+                return SimpleNamespace(returncode=1, stderr="Connection refused", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect):
+            result = worker._run_preflight_checks()
+
+        self.assertFalse(result)
+
+    def test_preflight_failure_skips_claim_and_recreates(self):
+        """Pre-flight failure should skip task claim and trigger TPU recreation."""
+        worker = self._make_worker()
+
+        worker._ensure_tpu_ready = Mock()
+        worker._ensure_bootstrap_ready = Mock(return_value=(True, False))
+        worker._check_host_health = Mock(return_value=True)
+        worker._run_preflight_checks = Mock(return_value=False)
+        worker._recreate_tpu = Mock(side_effect=KeyboardInterrupt())
+        worker._register = Mock()
+        worker.queue = Mock()
+
+        worker.run()
+
+        worker.queue.claim.assert_not_called()
+        worker._recreate_tpu.assert_called_once_with(reason="preflight_check_failed")
+
+    def test_preflight_checks_records_timeline_on_failure(self):
+        """Pre-flight failure should record a timeline event."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.get_num_workers.return_value = 2
+
+        timeline = []
+
+        def run_side_effect(cmd, capture_output=True, text=True, timeout=None):
+            command = " ".join(cmd)
+            if "metadata.google.internal" in command:
+                return SimpleNamespace(returncode=1, stderr="timeout", stdout="")
+            raise AssertionError(f"unexpected subprocess.run call: {command}")
+
+        with patch("jobman.worker.subprocess.run", side_effect=run_side_effect), \
+             patch.object(worker, "_record_timeline",
+                          side_effect=lambda event, **fields: timeline.append((event, fields))):
+            result = worker._run_preflight_checks()
+
+        self.assertFalse(result)
+        events = [e for e, _ in timeline]
+        self.assertIn("preflight_check_failed", events)
+
+    def test_is_maintenance_event_from_reason(self):
+        """_is_maintenance_event detects maintenance from reason string."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        self.assertTrue(worker._is_maintenance_event(
+            "wait_ready_unhealthy:TPU entered unhealthy state: maintenance event"
+        ))
+
+    def test_is_maintenance_event_from_health_description(self):
+        """_is_maintenance_event detects maintenance from TPU health description."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.health_description.return_value = "maintenance event scheduled"
+        self.assertTrue(worker._is_maintenance_event("status=UNHEALTHY"))
+
+    def test_is_maintenance_event_false_for_preemption(self):
+        """_is_maintenance_event returns False for non-maintenance reasons."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.health_description.return_value = ""
+        self.assertFalse(worker._is_maintenance_event("status=PREEMPTED"))
+
+    def test_recreate_tpu_maintenance_applies_backoff(self):
+        """Maintenance-triggered recreation should apply exponential backoff."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.return_value = "NOT_FOUND"
+        worker.tpu.health_description.return_value = "maintenance event"
+
+        sleep_calls = []
+        with patch("jobman.worker.time.sleep", side_effect=lambda s: sleep_calls.append(s)):
+            worker._recreate_tpu(reason="status=UNHEALTHY")
+
+        self.assertEqual(len(sleep_calls), 1)
+        self.assertEqual(sleep_calls[0], 60)  # first event: base backoff
+
+    def test_recreate_tpu_maintenance_exponential_backoff(self):
+        """Repeated maintenance events should increase backoff exponentially."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.return_value = "NOT_FOUND"
+        worker.tpu.health_description.return_value = "maintenance event"
+
+        sleep_calls = []
+        with patch("jobman.worker.time.sleep", side_effect=lambda s: sleep_calls.append(s)), \
+             patch("jobman.worker.time.time", return_value=1000.0):
+            worker._recreate_tpu(reason="status=UNHEALTHY")
+            worker._recreate_tpu(reason="status=UNHEALTHY")
+            worker._recreate_tpu(reason="status=UNHEALTHY")
+
+        self.assertEqual(sleep_calls, [60, 120, 240])
+
+    def test_recreate_tpu_no_backoff_for_non_maintenance(self):
+        """Non-maintenance recreations should not apply backoff."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.return_value = "NOT_FOUND"
+        worker.tpu.health_description.return_value = ""
+
+        sleep_calls = []
+        with patch("jobman.worker.time.sleep", side_effect=lambda s: sleep_calls.append(s)):
+            worker._recreate_tpu(reason="status=PREEMPTED")
+
+        self.assertEqual(len(sleep_calls), 0)
+
+    def test_recreate_tpu_maintenance_backoff_capped(self):
+        """Maintenance backoff should be capped at _MAINTENANCE_BACKOFF_MAX_SECS."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.return_value = "NOT_FOUND"
+        worker.tpu.health_description.return_value = "maintenance event"
+
+        sleep_calls = []
+        with patch("jobman.worker.time.sleep", side_effect=lambda s: sleep_calls.append(s)), \
+             patch("jobman.worker.time.time", return_value=1000.0):
+            for _ in range(10):
+                worker._recreate_tpu(reason="status=UNHEALTHY")
+
+        # All backoffs should be <= 1800
+        self.assertTrue(all(s <= 1800 for s in sleep_calls))
+        # Last few should be exactly 1800
+        self.assertEqual(sleep_calls[-1], 1800)
+
+    def test_recreate_tpu_maintenance_timeline_events(self):
+        """Maintenance recreation should log timeline events."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.return_value = "NOT_FOUND"
+        worker.tpu.health_description.return_value = "maintenance event"
+
+        timeline = []
+        with patch("jobman.worker.time.sleep"), \
+             patch.object(worker, "_record_timeline",
+                          side_effect=lambda event, **fields: timeline.append((event, fields))):
+            worker._recreate_tpu(reason="status=UNHEALTHY")
+
+        events = [e for e, _ in timeline]
+        self.assertIn("maintenance_event_detected", events)
+        self.assertIn("maintenance_backoff", events)
+
+        # Check maintenance_backoff has expected fields
+        backoff_entry = next((f for e, f in timeline if e == "maintenance_backoff"), None)
+        self.assertIsNotNone(backoff_entry)
+        self.assertEqual(backoff_entry["zone"], "us-central2-b")
+        self.assertEqual(backoff_entry["backoff_secs"], 60)
+        self.assertEqual(backoff_entry["recent_events"], 1)
+
+    def test_maintenance_backoff_resets_after_window(self):
+        """Maintenance events older than the window should be pruned."""
+        worker = self._make_worker()
+        worker.tpu = Mock()
+        worker.tpu.status.return_value = "NOT_FOUND"
+        worker.tpu.health_description.return_value = "maintenance event"
+
+        # Seed an old event outside the maintenance window
+        worker._zone_maintenance_events = [0.0]  # very old timestamp
+
+        sleep_calls = []
+        with patch("jobman.worker.time.sleep", side_effect=lambda s: sleep_calls.append(s)):
+            worker._recreate_tpu(reason="status=UNHEALTHY")
+
+        # Old event should be pruned; this is treated as the first event
+        self.assertEqual(sleep_calls[0], 60)
+        self.assertEqual(len(worker._zone_maintenance_events), 1)
+

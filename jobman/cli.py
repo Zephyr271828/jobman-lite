@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime
 from fnmatch import fnmatch
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -321,7 +325,7 @@ def worker():
 @click.option("--allocation-mode", "-m", default="queued-resources", type=MODE_CHOICES, show_default=True)
 @click.option("--startup-script", "-s", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="Optional bootstrap script to run on all TPU hosts before claiming tasks")
-@click.option("--ssh-user", "-u", default="zephyr", help="SSH username for connecting to TPU VMs (default: gcloud default)")
+@click.option("--ssh-user", "-u", default="yx3038", help="SSH username for connecting to TPU VMs (default: gcloud default)")
 @click.option("--debug", is_flag=True, default=False,
               help="Run interactively in the foreground with live output and no log files")
 def worker_start(accelerator, zone, tpu_name, pricing, allocation_mode, startup_script, ssh_user, debug):
@@ -576,7 +580,7 @@ def worker_delete(worker_refs, delete_all, accelerator, zone):
 @click.argument("worker_ref")
 @click.option("--worker-index", "-w", default=0, show_default=True,
               help="TPU worker index (for multi-host TPUs)")
-@click.option("--ssh-user", "-u", default="zephyr", help="SSH username for connecting to the TPU VM")
+@click.option("--ssh-user", "-u", default="yx3038", help="SSH username for connecting to the TPU VM")
 def worker_ssh(worker_ref, worker_index, ssh_user):
     """Open an interactive SSH session to a worker (by name or index from 'jobman status')."""
     registry = _read_workers()
@@ -634,16 +638,15 @@ def worker_sync(zone, startup_script):
     recovered_tmux = _sync_workers_from_tmux()
 
     # Determine zones to query
+    default_zones = {"us-central1-b", "us-central2-b", "us-east5-b", "us-central1-a", "us-east5-a"}
     if zone:
         zones = list(zone)
     else:
-        zones = sorted({
+        zones = sorted(default_zones | {
             w["zone"] for w in existing.values() if w.get("zone")
         } | {
             w["zone"] for w in recovered_tmux.values() if w.get("zone")
         })
-    if not zones:
-        zones = ["us-central1-b", "us-central2-b", "us-east5-b"]
 
     # Discover resources from GCP
     owner = _get_owner_prefix()
@@ -673,6 +676,11 @@ def worker_sync(zone, startup_script):
             # Update status to running if tmux session exists
             if worker_id in recovered_tmux:
                 merged[worker_id]["status"] = "running"
+            # If GCP reports suspended/failed, trust that over local state
+            elif worker_id in gcp_workers:
+                gcp_status = gcp_workers[worker_id].get("status", "")
+                if gcp_status in ("suspended", "failed"):
+                    merged[worker_id]["status"] = gcp_status
 
     if not merged:
         click.echo("No workers found from tmux sessions or GCP.")
@@ -731,10 +739,11 @@ def worker_show(worker_ref):
         snapshot_path = os.path.join(jobman_log_dir(), "workers", w["worker_id"], os.path.basename(startup_script))
         click.echo(f"Setup             : {snapshot_path}")
     process_status = _process_status(w)
-    vm_status, qr_status = _query_tpu_statuses(w)
+    vm_status, qr_status, health_status = _query_tpu_statuses(w)
     click.echo(f"Process status    : {process_status}")
     click.echo(f"VM status         : {vm_status}")
     click.echo(f"QR status         : {qr_status}")
+    click.echo(f"Health status     : {health_status}")
     click.echo(f"Attach with       : tmux attach -t jobman_{w['worker_id']}")
     tpu_url = _tpu_console_url(w)
     if tpu_url:
@@ -900,17 +909,8 @@ def requeue(task_refs, requeue_all, accelerator, zone, pattern):
         sys.exit(1)
 
 
-@cli.command("status")
-@click.option("--accelerator", "-a", default=None, help="Filter by accelerator type, e.g. v4-8")
-@click.option("--zone", "-z", default=None, help="Filter by GCP zone, e.g. us-central2-b")
-@click.option("--live-only", "-lo", is_flag=True, help="Show only workers with queued-resource status ACTIVE")
-@click.option("--workers-only", "-wo", is_flag=True, help="Show only the worker table")
-@click.option("--task-only", "-to", is_flag=True, help="Show only the task table")
-def status(accelerator, zone, live_only, workers_only, task_only):
-    """Show workers and task queue summary."""
-    if workers_only and task_only:
-        raise click.UsageError("--workers-only and --task-only cannot be used together")
-
+def _print_status(accelerator, zone, live_only, workers_only, task_only, quiet=False):
+    """Render the status output once."""
     registry = _read_workers()
     all_workers = list(registry.values())
     filtered_workers = [
@@ -922,13 +922,13 @@ def status(accelerator, zone, live_only, workers_only, task_only):
     if not task_only:
         click.echo("=== Workers ===")
         if filtered_workers:
-            click.echo("Fetching TPU status from GCP...", err=True)
+            if not quiet:
+                click.echo("Fetching TPU status from GCP...", err=True)
             statuses = _fetch_worker_statuses({w["worker_id"]: w for _, w in filtered_workers})
             running_tasks_by_worker = _running_tasks_by_worker()
-            click.echo(f"{'#':<4} {'WORKER':<28} {'ACCELERATOR':<12} {'ZONE':<20} {'STATUS':<10} {'VM':<10} {'QR'}")
             rows = []
             for idx, w in filtered_workers:
-                pstatus, vm_status, qr_status = statuses.get(w["worker_id"], ("?", "?", "?"))
+                pstatus, vm_status, qr_status, health_status = statuses.get(w["worker_id"], ("?", "?", "?", "UNKNOWN"))
                 if live_only and qr_status.upper() != "ACTIVE":
                     continue
                 display_status = _worker_display_status(
@@ -936,13 +936,22 @@ def status(accelerator, zone, live_only, workers_only, task_only):
                     process_status=pstatus,
                     vm_status=vm_status,
                     qr_status=qr_status,
+                    health_status=health_status,
                     has_running_task=w["worker_id"] in running_tasks_by_worker,
                 )
-                rows.append((idx, w, display_status, vm_status, qr_status))
+                rows.append((idx, w, display_status, vm_status, qr_status, health_status))
             if rows:
-                for idx, w, display_status, vm_status, qr_status in rows:
-                    click.echo(f"{idx:<4} {w['worker_id']:<28} {w['accelerator']:<12} {w['zone']:<20} "
-                               f"{display_status:<10} {vm_status:<10} {qr_status}")
+                zones_order = sorted({w["zone"] for _, w, *_ in rows})
+                for z in zones_order:
+                    zone_rows = sorted(
+                        [r for r in rows if r[1]["zone"] == z],
+                        key=lambda r: r[1].get("accelerator", ""),
+                    )
+                    click.echo(f"\n  --- Zone: {z} ---")
+                    click.echo(f"  {'#':<4} {'WORKER':<28} {'ACCELERATOR':<12} {'STATUS':<10} {'VM':<12} {'QR':<14} HEALTH")
+                    for idx, w, display_status, vm_status, qr_status, health_status in zone_rows:
+                        click.echo(f"  {idx:<4} {w['worker_id']:<28} {w['accelerator']:<12} "
+                                   f"{display_status:<10} {vm_status:<12} {qr_status:<14} {health_status}")
             else:
                 click.echo("  (none)")
         else:
@@ -965,12 +974,70 @@ def status(accelerator, zone, live_only, workers_only, task_only):
     if not tasks:
         click.echo("  (empty)")
         return
-    click.echo(f"{'#':<4} {'ID':<18} {'NAME':<40} {'STATUS':<12} {'RETRY':<7} {'ACCELERATOR':<12} {'ZONE':<20} {'WORKER'}")
-    for idx, t in tasks:
-        worker_id = t.get("worker_id") or "-"
-        retry = f"{t.get('fail_count', 0)}/{t.get('max_retries', 3)}"
-        click.echo(f"{idx:<4} {t['id']:<18} {t['name']:<40} {t['status']:<12} {retry:<7} "
-                   f"{t['accelerator']:<12} {t.get('zone',''):<20} {worker_id}")
+    task_zones_order = sorted({t.get("zone") or "" for _, t in tasks})
+    for z in task_zones_order:
+        zone_tasks = sorted(
+            [(idx, t) for idx, t in tasks if (t.get("zone") or "") == z],
+            key=lambda x: x[1].get("accelerator", ""),
+        )
+        zone_label = z if z else "(no zone)"
+        click.echo(f"\n  --- Zone: {zone_label} ---")
+        click.echo(f"  {'#':<4} {'ID':<18} {'NAME':<40} {'STATUS':<12} {'RETRY':<7} {'ACCELERATOR':<12} {'WORKER'}")
+        for idx, t in zone_tasks:
+            worker_id = t.get("worker_id") or "-"
+            retry = f"{t.get('fail_count', 0)}/{t.get('max_retries', 3)}"
+            click.echo(f"  {idx:<4} {t['id']:<18} {t['name']:<40} {t['status']:<12} {retry:<7} "
+                       f"{t['accelerator']:<12} {worker_id}")
+
+
+@cli.command("status")
+@click.option("--accelerator", "-a", default=None, help="Filter by accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Filter by GCP zone, e.g. us-central2-b")
+@click.option("--live-only", "-lo", is_flag=True, help="Show only workers with queued-resource status ACTIVE")
+@click.option("--workers-only", "-wo", is_flag=True, help="Show only the worker table")
+@click.option("--task-only", "-to", is_flag=True, help="Show only the task table")
+@click.option("--watch", "-w", is_flag=True, help="Continuously refresh status (Ctrl+C to stop)")
+@click.option("--interval", "-n", default=5, show_default=True, help="Refresh interval in seconds (with --watch)")
+def status(accelerator, zone, live_only, workers_only, task_only, watch, interval):
+    """Show workers and task queue summary."""
+    if workers_only and task_only:
+        raise click.UsageError("--workers-only and --task-only cannot be used together")
+
+    if not watch:
+        _print_status(accelerator, zone, live_only, workers_only, task_only)
+        return
+
+    try:
+        while True:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                _print_status(accelerator, zone, live_only, workers_only, task_only, quiet=True)
+            click.clear()
+            sys.stdout.write(buf.getvalue())
+            sys.stdout.write(f"\nLast updated: {datetime.now().strftime('%H:%M:%S')}\n")
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
+@cli.command("availability")
+@click.option("--accelerator", "-a", default=None, help="Filter by accelerator type, e.g. v4-8")
+@click.option("--zone", "-z", default=None, help="Filter by GCP zone, e.g. us-central2-b")
+@click.option("--prefix", "-p", default=None, help="Filter workers by name prefix, e.g. yufeng-")
+def availability(accelerator, zone, prefix):
+    """Show TPU availability profile from timeline data."""
+    from .availability import compute_availability, format_report
+
+    stats_by_worker, stats_by_accel = compute_availability(
+        worker_prefix=prefix,
+        accelerator=accelerator,
+        zone=zone,
+    )
+    if not stats_by_worker:
+        click.echo("No timeline data found.")
+        return
+    click.echo(format_report(stats_by_worker, stats_by_accel))
 
 
 @task.command("show")
@@ -1051,7 +1118,7 @@ def _process_status(w: dict) -> str:
     return stored
 
 
-def _query_tpu_statuses(w: dict) -> tuple[str, str]:
+def _query_tpu_statuses(w: dict) -> tuple[str, str, str]:
     """Query live TPU VM and queued-resource states from GCP."""
     try:
         tpu = TPU(
@@ -1060,9 +1127,9 @@ def _query_tpu_statuses(w: dict) -> tuple[str, str]:
             accelerator=w["accelerator"],
             mode=w.get("mode", "tpu-vm"),
         )
-        return tpu.vm_status(), tpu.queued_resource_status()
+        return tpu.vm_status(), tpu.queued_resource_status(), tpu.health_status()
     except Exception:
-        return "UNKNOWN", "UNKNOWN"
+        return "UNKNOWN", "UNKNOWN", "UNKNOWN"
 
 
 def _host0_ip(worker: dict) -> str:
@@ -1114,20 +1181,20 @@ def _host0_ip(worker: dict) -> str:
 
 def _fetch_worker_statuses(workers: dict) -> dict:
     """Fetch process + TPU status for all workers in parallel.
-    Returns {worker_id: (process_status, vm_status, qr_status)}.
+    Returns {worker_id: (process_status, vm_status, qr_status, health_status)}.
     """
     results = {}
 
     def fetch_one(w):
-        vm_status, qr_status = _query_tpu_statuses(w)
-        return w["worker_id"], _process_status(w), vm_status, qr_status
+        vm_status, qr_status, health_status = _query_tpu_statuses(w)
+        return w["worker_id"], _process_status(w), vm_status, qr_status, health_status
 
     with ThreadPoolExecutor(max_workers=min(len(workers), 8)) as ex:
         futures = {ex.submit(fetch_one, w): w["worker_id"] for w in workers.values()}
         with click.progressbar(length=len(futures), label="Fetching TPU status", show_pos=True) as bar:
             for fut in as_completed(futures):
-                wid, pstatus, vm_status, qr_status = fut.result()
-                results[wid] = (pstatus, vm_status, qr_status)
+                wid, pstatus, vm_status, qr_status, health_status = fut.result()
+                results[wid] = (pstatus, vm_status, qr_status, health_status)
                 bar.update(1)
 
     return results
@@ -1149,15 +1216,19 @@ def _worker_display_status(
     process_status: str,
     vm_status: str,
     qr_status: str,
+    health_status: str = "UNKNOWN",
     has_running_task: bool,
 ) -> str:
     """Return the user-facing worker status shown by `jobman status`."""
     process = (process_status or "").lower()
     vm = (vm_status or "").upper()
     qr = (qr_status or "").upper()
+    health = (health_status or "").upper()
 
     if process in {"dead", "stopped"}:
         return process
+    if vm == "UNHEALTHY" or health == "UNHEALTHY":
+        return "unhealthy"
     if qr != "ACTIVE" or vm in {"", "UNKNOWN", "CREATING", "NOT_FOUND"}:
         return "pending"
     if process == "setup":
@@ -1528,9 +1599,8 @@ def _sync_workers_from_tmux() -> dict:
             "status": "running",
             "registered": first["time"],
             "pid": 0,
+            "ssh_user": "yx3038",
         }
-        if first.get("ssh_user"):
-            entry["ssh_user"] = first["ssh_user"]
         registry[worker_id] = entry
 
     return registry
@@ -1545,6 +1615,58 @@ def _get_owner_prefix() -> str | None:
         return owner_path.read_text().strip()
     except OSError:
         return None
+
+
+def _extract_accelerator_from_gcp_qr(item: dict) -> tuple[str, str]:
+    """Extract accelerator type and node ID from a GCP queued-resource JSON.
+
+    Returns (accelerator, node_id) where either may be "".
+    Handles multiple GCP API response formats including v5p resources.
+    """
+    # Try to extract node_id with fallbacks
+    node_id = ""
+    try:
+        node_spec = item.get("tpu", {}).get("nodeSpec")
+        if isinstance(node_spec, list) and node_spec:
+            node_id = node_spec[0].get("nodeId", "")
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    # Extract accelerator from multiple possible paths
+    accelerator = ""
+
+    # Path 1: Top-level acceleratorType
+    if item.get("acceleratorType"):
+        accelerator = str(item["acceleratorType"])
+
+    # Path 2: nodeSpec as dict with acceleratorType
+    if not accelerator:
+        try:
+            node_spec = item.get("tpu", {}).get("nodeSpec")
+            if isinstance(node_spec, dict) and node_spec.get("acceleratorType"):
+                accelerator = str(node_spec["acceleratorType"])
+        except (KeyError, TypeError):
+            pass
+
+    # Path 3: nodeSpec[0]["node"]["acceleratorType"] (standard path for v4/v5e)
+    if not accelerator:
+        try:
+            node_spec = item.get("tpu", {}).get("nodeSpec")
+            if isinstance(node_spec, list) and node_spec:
+                accelerator = str(node_spec[0]["node"]["acceleratorType"])
+        except (KeyError, IndexError, TypeError):
+            pass
+
+    # Path 4: nodeSpecs (plural) with acceleratorType (for some v5p resources)
+    if not accelerator:
+        try:
+            node_specs = item.get("tpu", {}).get("nodeSpecs")
+            if isinstance(node_specs, list) and node_specs:
+                accelerator = str(node_specs[0]["node"]["acceleratorType"])
+        except (KeyError, IndexError, TypeError):
+            pass
+
+    return accelerator, node_id
 
 
 def _discover_workers_from_gcp(zones: list[str], owner: str) -> dict:
@@ -1574,26 +1696,31 @@ def _discover_workers_from_gcp(zones: list[str], owner: str) -> dict:
                 qr_name = item["name"].split("/")[-1]
                 if not qr_name.startswith(owner):
                     continue
-                # Extract node-id (the TPU VM name)
-                try:
-                    node_id = item["tpu"]["nodeSpec"][0]["nodeId"]
-                except (KeyError, IndexError, TypeError):
+
+                # Extract accelerator and node-id with fallbacks for different GCP API formats
+                accelerator, node_id = _extract_accelerator_from_gcp_qr(item)
+                if not node_id:
                     node_id = qr_name
-                # Extract accelerator
-                try:
-                    accelerator = item["tpu"]["nodeSpec"][0]["node"]["acceleratorType"]
-                except (KeyError, IndexError, TypeError):
-                    accelerator = ""
+
                 # Extract state
                 state = item.get("state", {})
                 if isinstance(state, dict):
                     state = state.get("state", "UNKNOWN")
                 state = str(state).upper()
+
                 # Extract runtime version
+                tpu_version = ""
                 try:
-                    tpu_version = item["tpu"]["nodeSpec"][0]["node"]["runtimeVersion"]
+                    node_spec = item.get("tpu", {}).get("nodeSpec")
+                    if isinstance(node_spec, list) and node_spec:
+                        tpu_version = node_spec[0].get("node", {}).get("runtimeVersion", "")
                 except (KeyError, IndexError, TypeError):
-                    tpu_version = resolve_tpu_version(accelerator) if accelerator else ""
+                    pass
+
+                # If we couldn't extract tpu_version from GCP, derive from accelerator
+                if not tpu_version and accelerator:
+                    tpu_version = resolve_tpu_version(accelerator)
+
                 # Determine pricing from presence of "spot" key
                 pricing = "spot" if "spot" in item else "standard"
 
